@@ -2,119 +2,94 @@
 
 # Lobster
 
-> Constrained computer-use for macOS.
+> Constrained computer-use agent for macOS.
 
-`Lobster` is a `TypeScript-first` desktop agent built with `Electron + Node.js + Swift`.
-It receives natural-language instructions from `Telegram` or a local console, then opens apps, inspects UI state, types, clicks, searches for files, prepares handoffs, and reports progress under explicit approval-aware guardrails.
+![macOS](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)
+![Electron](https://img.shields.io/badge/Electron-desktop-47848F?logo=electron&logoColor=white)
+![Swift](https://img.shields.io/badge/Swift-6-FA7343?logo=swift&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Status](https://img.shields.io/badge/status-alpha-0F766E)
+
+Lobster turns natural-language instructions into real, approval-aware desktop actions on a Mac.
+It can open apps, inspect UI state, click, type, search files, and prepare handoffs while keeping risky steps behind explicit guardrails.
+
+[Quick Start](./docs/quickstart.md) · [Features](#features) · [Architecture](./docs/architecture.md) · [Troubleshooting](./docs/troubleshooting.md) · [中文](./README.zh-CN.md)
+
+## Features
+
+- Real desktop execution on `macOS`
+- Chat-driven control through `Telegram` or a local console
+- Approval-first safety with `green`, `yellow`, and `red` levels
+- File search and handoff preparation
+- Native `Swift` bridge for actual desktop interaction
+- Skill and workflow evolution with governance
 
 ## Why Lobster
 
-Lobster is not trying to be an unrestricted automation bot.
-It is designed for operators who want real computer-use on a real Mac, but still need boundaries, approvals, and traceability.
+Lobster is not an unrestricted automation bot.
+It is designed for operators who want useful computer-use on a real Mac without losing traceability, approvals, or control.
 
-- It works with actual desktop apps, not just browser tabs.
-- It keeps risky actions behind approvals instead of silently executing them.
-- It can be driven remotely through chat while still running on your own machine.
-- It records runs, approvals, and outcomes so failures are debuggable.
+## Choose Your Path
 
-## Product Highlights
+### 1. Local chat demo
 
-### Real desktop execution
+Use this when you want the fastest first success without permissions work.
 
-- Open and focus applications.
-- Inspect UI trees and visible targets.
-- Click, type, scroll, and trigger keyboard actions.
-- Search for local files and prepare them for handoff.
-
-### Chat-driven control
-
-- Accept instructions from `Telegram`.
-- Support local operator flows through the desktop console and REPL.
-- Separate chat-only interactions from action-execution flows with `/chat` and `/do`.
-
-### Approval-first safety model
-
-- `green`: execute automatically.
-- `yellow`: require stronger verification and one-time approval.
-- `red`: never auto-execute and never bypass.
-
-### Built for extension
-
-- Pluggable chat-app strategies.
-- Configurable model routing.
-- Skill and workflow evolution with explicit governance.
-- Native macOS bridge for real computer-use instead of browser-only simulation.
-
-## Example Workflows
-
-- Open `Finder`, locate a document, and prepare it for transfer in a chat app.
-- Inspect an incoming notification, open the related app, and summarize what needs attention.
-- Draft a reply or file handoff, then stop at approval instead of sending automatically.
-- Search for a local file by name when the user only gives a fuzzy natural-language request.
-
-## How It Works
-
-```mermaid
-flowchart LR
-    A["Telegram / Local Console"] --> B["Task Orchestrator"]
-    B --> C["Observe"]
-    C --> D["Plan"]
-    D --> E["Self-Check"]
-    E --> F["Policy Gate"]
-    F --> G["Act"]
-    G --> H["Verify / Recover"]
-    H --> I["Logs / Approvals / Result"]
+```bash
+pnpm install
+pnpm init:daemon
+pnpm --filter lobsterd run chat:repl
 ```
 
-## Safety Model
+### 2. Telegram remote control
 
-| Level | Meaning | Typical Outcome |
-| --- | --- | --- |
-| `green` | Low-risk action with clear verification | Runs automatically |
-| `yellow` | Action is allowed, but needs stronger checks | Stops for one-time approval |
-| `red` | Outside the allowed boundary | Refused with explanation and safer alternatives |
+Use this when you want to send `/chat` or `/do` commands from Telegram and have them land on your Mac.
 
-Lobster is intentionally conservative around actions such as sending, uploading, deleting, paying, changing security settings, or modifying its own hard safety rules.
+```bash
+pnpm --filter lobsterd run doctor
+pnpm dev:daemon:oneclick
+```
+
+### 3. Real desktop control
+
+Use this when you want Lobster to click, type, open apps, and inspect the UI on the local machine.
+
+Grant `Accessibility`, `Screen Recording`, and `Automation` permissions in `System Settings -> Privacy & Security`, then start the daemon and desktop app.
+
+```bash
+pnpm dev:daemon:oneclick
+pnpm dev:app
+```
 
 ## Quick Start
 
-### 1. Install dependencies
+1. Install dependencies.
 
 ```bash
 pnpm install
 ```
 
-### 2. Run the bootstrap wizard
+2. Bootstrap local configuration.
 
 ```bash
 pnpm init:daemon
 ```
 
-This generates local runtime configuration such as model credentials, transport settings, and operator preferences.
-
-### 3. Start the daemon
+3. Start the daemon and native bridge.
 
 ```bash
 pnpm dev:daemon:oneclick
 ```
 
-This prepares the native bridge first and then starts `lobsterd`.
-
-### 4. Pick an operator surface
-
-Desktop console:
+4. Open the desktop console or local REPL.
 
 ```bash
 pnpm dev:app
-```
-
-Local chat REPL:
-
-```bash
 pnpm --filter lobsterd run chat:repl
 ```
 
-### 5. Check runtime readiness
+5. Check readiness and troubleshoot if needed.
 
 ```bash
 pnpm --filter lobsterd run doctor
@@ -130,56 +105,25 @@ pnpm --filter lobsterd run doctor
 /deny <ticketId>
 ```
 
-## macOS Permissions
+## Safety Model
 
-For real desktop control instead of stub behavior, grant the native bridge the required permissions in:
+| Level | Meaning | Outcome |
+| --- | --- | --- |
+| `green` | Low-risk action with clear verification | Runs automatically |
+| `yellow` | Allowed, but needs stronger checks | Stops for one-time approval |
+| `red` | Outside the allowed boundary | Refused with explanation |
 
-`System Settings -> Privacy & Security`
+Lobster is intentionally conservative around sending, uploading, deleting, paying, changing security settings, and modifying hard safety rules.
 
-Required permissions:
+## Docs
 
-- `Accessibility`
-- `Screen Recording`
-- `Automation` for cross-app control
-
-## Tech Stack
-
-- `apps/desktop`: Electron operator console
-- `services/lobsterd`: orchestration runtime and IPC service
-- `native/lobster-bridge`: Swift macOS bridge
-- `packages/policy`: approval and constraint engine
-- `packages/storage`: SQLite and JSON fallback persistence
-- `packages/skills`: starter skills and application catalog
-
-## Repository Layout
-
-- `apps/desktop`: desktop control surface
-- `services/lobsterd`: main daemon
-- `packages/*`: shared runtime packages
-- `native/lobster-bridge`: native macOS control bridge
-- `config/*`: public configuration templates and policies
-
-## Public Repository Notes
-
-Safe to publish:
-
-- source code
-- docs
-- tests
-- `config/runtime.env.example`
-- `config/models.yaml`
-- `config/chat_plugins.yaml`
-- `config/constitution.yaml`
-
-Keep local only:
-
-- `config/runtime.env`
-- `config/secrets/*`
-- `config/certs/*`
-- logs, databases, temporary runtime state, and build artifacts
+- [Quick Start](./docs/quickstart.md)
+- [Architecture](./docs/architecture.md)
+- [Troubleshooting](./docs/troubleshooting.md)
+- [Use Cases](./docs/use-cases.md)
+- [Chinese README](./README.zh-CN.md)
 
 ## Status
 
-Lobster is already beyond a pure prototype: the current focus is turning it into a reliable early-stage product for constrained desktop operations on `macOS`.
-
-It is strongest today in operator-assisted workflows, approval-gated actions, Telegram ingress, file preparation, and desktop control primitives. It is not positioned as a fully autonomous general desktop AGI system.
+Lobster is an early-stage product, not a fully autonomous desktop AGI.
+Its strongest areas today are operator-assisted workflows, approval-gated actions, Telegram ingress, file preparation, and native macOS control.

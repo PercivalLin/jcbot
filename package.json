@@ -14,6 +14,7 @@
     "lint": "pnpm -r lint",
     "dev:daemon": "pnpm --filter lobsterd run start",
     "dev:daemon:oneclick": "pnpm --filter lobsterd run bridge:prepare && pnpm --filter lobsterd run start",
+    "dev:admin": "pnpm --filter lobster-admin-web dev",
     "init:daemon": "pnpm --filter lobsterd run init",
     "reset:daemon": "pnpm --filter lobsterd run reset",
     "dev:app": "pnpm --filter lobster-app dev"

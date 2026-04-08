@@ -40,8 +40,26 @@ describe("telegramIngress", () => {
 
     expect(command.kind).toBe("approval.approve");
     if (command.kind === "approval.approve") {
+      expect(command.chatId).toBe("999");
       expect(command.ticketId).toBe("ticket-123456");
       expect(command.approvedBy).toBe("999");
+    }
+  });
+
+  it("maps inline approval callback payloads", () => {
+    const command = normalizeTelegramCommand({
+      callbackQueryId: "callback-1",
+      chatId: "999",
+      eventId: "evt_cb",
+      receivedAt: new Date().toISOString(),
+      text: "tg:approve:ticket-654321"
+    });
+
+    expect(command.kind).toBe("approval.approve");
+    if (command.kind === "approval.approve") {
+      expect(command.callbackQueryId).toBe("callback-1");
+      expect(command.chatId).toBe("999");
+      expect(command.ticketId).toBe("ticket-654321");
     }
   });
 
@@ -76,6 +94,24 @@ describe("telegramIngress", () => {
     expect(command.kind).toBe("task.create");
     if (command.kind === "task.create") {
       expect(command.request.text).toContain("Finder");
+    }
+  });
+
+  it("maps /status to run.status with optional run id", () => {
+    const command = normalizeTelegramCommandWithMode(
+      {
+        chatId: "999",
+        eventId: "evt_status",
+        receivedAt: new Date().toISOString(),
+        text: "/status run-abcdef12"
+      },
+      "hybrid"
+    );
+
+    expect(command.kind).toBe("run.status");
+    if (command.kind === "run.status") {
+      expect(command.chatId).toBe("999");
+      expect(command.runId).toBe("run-abcdef12");
     }
   });
 

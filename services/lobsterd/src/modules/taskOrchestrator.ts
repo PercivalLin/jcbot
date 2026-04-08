@@ -9,9 +9,12 @@ import {
   type DesktopAction,
   type DesktopObservation,
   type PolicyDecision,
+  type RunEvent,
   type SelfCheckResult,
   type TaskRequest,
-  type TaskRun
+  type TaskRun,
+  type VerificationEvidenceItem,
+  type VerificationResult
 } from "@lobster/shared";
 import { evaluateActionAgainstConstitution, flattenRules, loadConstitution } from "@lobster/policy";
 import { gateAction } from "@lobster/policy";
@@ -24,6 +27,11 @@ import {
 import { ModelRouter } from "./modelRouter.js";
 import type { BridgeClient } from "./bridgeClient.js";
 import type { ChatPluginInstance } from "./chatPluginRegistry.js";
+import {
+  buildPlannerPrompt,
+  buildVisionVerificationPrompt,
+  buildVisionVerificationSystemPrompt
+} from "./modelRoles.js";
 import { tryBuildOperationTemplatePlan } from "./operationTemplates.js";
 import { resolveWorkspaceConfigFile } from "./paths.js";
 
@@ -148,14 +156,14 @@ export class TaskOrchestrator {
   private readonly graph = new StateGraph(OrchestratorState)
     .addNode("contextBuild", async (state) => {
       const observation = await this.bridgeClient.snapshot();
-      return {
-        observation,
-        run: {
-          ...state.run,
-          status: "context_build",
-          updatedAt: new Date().toISOString()
-        }
+      const run = {
+        ...state.run,
+        latestObservation: observation,
+        status: "context_build" as const,
+        updatedAt: new Date().toISOString()
       };
+      await this.emitRunEvent(run, "run.status_changed", "Observing current desktop state.");
+      return { observation, run };
     })
     .addNode("planDraft", async (state) => {
       const plan =
@@ -165,30 +173,29 @@ export class TaskOrchestrator {
           ? state.run.currentStepId
           : plan[0]?.id;
 
-      return {
-        run: {
-          ...state.run,
-          status: "planned",
-          currentStepId,
-          plan,
-          updatedAt: new Date().toISOString()
-        }
+      const run = {
+        ...state.run,
+        status: "planned" as const,
+        currentStepId,
+        plan,
+        updatedAt: new Date().toISOString()
       };
+      await this.emitRunEvent(run, "run.status_changed", "Task plan is ready.");
+      return { run };
     })
     .addNode("selfCheckPass", async (state) => {
       const action = this.resolveCurrentAction(state.run);
       const selfCheck = evaluateActionAgainstConstitution(action, this.rules);
-      return {
-        run: {
-          ...state.run,
-          status: "self_checked",
-          riskLevel: selfCheck.overallRisk,
-          selfCheck,
-          outcomeSummary: undefined,
-          updatedAt: new Date().toISOString()
-        },
-        selfCheck
+      const run = {
+        ...state.run,
+        status: "self_checked" as const,
+        riskLevel: selfCheck.overallRisk,
+        selfCheck,
+        outcomeSummary: undefined,
+        updatedAt: new Date().toISOString()
       };
+      await this.emitRunEvent(run, "run.status_changed", "Policy self-check finished.");
+      return { run, selfCheck };
     })
     .addNode("riskGate", async (state) => {
       const action = this.resolveCurrentAction(state.run);
@@ -197,16 +204,24 @@ export class TaskOrchestrator {
         selfCheck: state.selfCheck ?? evaluateActionAgainstConstitution(action, this.rules),
         approvalToken: state.approvalToken
       });
+      const status: TaskRun["status"] = decision.allowed
+        ? "executing"
+        : decision.requiresApproval
+          ? "awaiting_approval"
+          : "blocked";
 
-      return {
-        run: {
-          ...state.run,
-          status: decision.allowed ? "executing" : decision.requiresApproval ? "awaiting_approval" : "blocked",
-          outcomeSummary: decision.allowed ? undefined : decision.reason,
-          updatedAt: new Date().toISOString()
-        },
-        decision
+      const run = {
+        ...state.run,
+        status,
+        outcomeSummary: decision.allowed ? undefined : decision.reason,
+        updatedAt: new Date().toISOString()
       };
+      await this.emitRunEvent(
+        run,
+        decision.requiresApproval ? "approval.requested" : "run.status_changed",
+        decision.allowed ? "Action cleared risk gate." : decision.reason
+      );
+      return { run, decision };
     })
     .addNode("execute", async (state) => {
       if (!state.decision?.allowed) {
@@ -216,6 +231,7 @@ export class TaskOrchestrator {
       const action = this.resolveCurrentAction(state.run);
       const bridgeDecision = await this.bridgeClient.validateAction(action, state.approvalToken);
       if (!bridgeDecision.allowed) {
+        const status: TaskRun["status"] = action.riskLevel === "yellow" ? "awaiting_approval" : "blocked";
         return {
           decision: {
             allowed: false,
@@ -226,7 +242,7 @@ export class TaskOrchestrator {
           },
           run: {
             ...state.run,
-            status: action.riskLevel === "yellow" ? "awaiting_approval" : "blocked",
+            status,
             outcomeSummary: bridgeDecision.reason,
             updatedAt: new Date().toISOString()
           }
@@ -234,15 +250,15 @@ export class TaskOrchestrator {
       }
 
       const execution = await this.bridgeClient.performAction(action, state.approvalToken);
-      return {
-        executionReport: execution.status,
-        run: {
-          ...state.run,
-          status: "verifying",
-          outcomeSummary: execution.status,
-          updatedAt: new Date().toISOString()
-        }
+      const run = {
+        ...state.run,
+        status: "verifying" as const,
+        verification: undefined,
+        outcomeSummary: execution.status,
+        updatedAt: new Date().toISOString()
       };
+      await this.emitRunEvent(run, "run.status_changed", `Action dispatched: ${execution.status}`);
+      return { executionReport: execution.status, run };
     })
     .addNode("verify", async (state) => {
       if (!state.decision?.allowed) {
@@ -251,17 +267,23 @@ export class TaskOrchestrator {
 
       const action = this.resolveCurrentAction(state.run);
       const observation = await this.bridgeClient.snapshot();
-      const verification = this.verifyActionOutcome(action, state.observation, observation, state.executionReport);
-      return {
+      const baseVerification = this.verifyActionOutcome(action, state.observation, observation, state.executionReport);
+      const verification = await this.refineVerificationWithVision(
+        action,
+        state.observation,
         observation,
-        executionReport: verification.message,
-        run: {
-          ...state.run,
-          status: verification.ok ? "completed" : "failed",
-          outcomeSummary: verification.message,
-          updatedAt: new Date().toISOString()
-        }
+        baseVerification
+      );
+      const run = {
+        ...state.run,
+        status: this.statusForVerification(verification),
+        latestObservation: observation,
+        verification,
+        outcomeSummary: verification.message,
+        updatedAt: new Date().toISOString()
       };
+      await this.emitRunEvent(run, "run.status_changed", verification.message);
+      return { observation, executionReport: verification.message, run };
     })
     .addNode("report", async (state) => {
       const denialExplanation =
@@ -301,12 +323,18 @@ export class TaskOrchestrator {
     private readonly bridgeClient: BridgeClient,
     private readonly options: {
       chatPlugins?: ChatPluginInstance[];
+      onRunEvent?: (event: RunEvent, run: TaskRun) => Promise<void>;
     } = {}
   ) {}
 
   async createRun(request: TaskRequest): Promise<{ run: TaskRun; approvalTicket?: ApprovalTicket }> {
     const normalizedRequest = await this.normalizeRequestApplicationTarget(request);
     if ("blockedRun" in normalizedRequest) {
+      await this.emitRunEvent(
+        normalizedRequest.blockedRun,
+        "run.created",
+        normalizedRequest.blockedRun.outcomeSummary ?? "Task blocked during application resolution."
+      );
       return {
         run: normalizedRequest.blockedRun
       };
@@ -314,22 +342,30 @@ export class TaskOrchestrator {
 
     const semanticNormalizedRequest = await this.normalizeRequestSemanticTargets(normalizedRequest.request);
     if ("blockedRun" in semanticNormalizedRequest) {
+      await this.emitRunEvent(
+        semanticNormalizedRequest.blockedRun,
+        "run.created",
+        semanticNormalizedRequest.blockedRun.outcomeSummary ?? "Task blocked during semantic target resolution."
+      );
       return {
         run: semanticNormalizedRequest.blockedRun
       };
     }
 
     const runtimeRequest = semanticNormalizedRequest.request;
-    return this.continueRun({
+    const run: TaskRun = {
       runId: randomUUID(),
       request: runtimeRequest,
       status: "queued",
       riskLevel: "green",
       plan: [],
+      latestObservation: undefined,
       outcomeSummary: undefined,
       createdAt: runtimeRequest.createdAt,
       updatedAt: runtimeRequest.createdAt
-    });
+    };
+    await this.emitRunEvent(run, "run.created", "Task accepted and queued.");
+    return this.continueRun(run);
   }
 
   async resumeRun(
@@ -357,6 +393,7 @@ export class TaskOrchestrator {
       }
 
       if (state.decision?.requiresApproval && currentStep && nextRun.selfCheck) {
+        await this.emitRunEvent(nextRun, "approval.requested", this.buildApprovalReason(state.decision.reason, nextRun.selfCheck));
         return {
           run: nextRun,
           approvalTicket: {
@@ -382,14 +419,20 @@ export class TaskOrchestrator {
             nextRun = {
               ...nextRun,
               status: "queued",
+              verification: undefined,
               outcomeSummary: this.buildRecoverySummary(currentStep.action, attempts, nextRun.outcomeSummary),
               updatedAt: new Date().toISOString()
             };
+            await this.emitRunEvent(nextRun, "run.note", nextRun.outcomeSummary ?? "Retrying failed step.");
             token = undefined;
             continue;
           }
         }
 
+        return { run: nextRun };
+      }
+
+      if (nextRun.status === "blocked") {
         return { run: nextRun };
       }
 
@@ -403,15 +446,47 @@ export class TaskOrchestrator {
         ...nextRun,
         currentStepId: nextStep.id,
         status: "queued",
+        verification: undefined,
         updatedAt: new Date().toISOString()
       };
+      await this.emitRunEvent(nextRun, "run.step_advanced", `Advancing to step ${nextStep.title}.`);
       token = undefined;
     }
+  }
+
+  private async emitRunEvent(run: TaskRun, kind: RunEvent["kind"], message: string) {
+    if (!this.options.onRunEvent) {
+      return;
+    }
+
+    await this.options.onRunEvent(
+      {
+        eventId: randomUUID(),
+        runId: run.runId,
+        kind,
+        status: run.status,
+        stepId: run.currentStepId,
+        message,
+        createdAt: new Date().toISOString()
+      },
+      run
+    );
   }
 
   private buildApprovalReason(baseReason: string, selfCheck: SelfCheckResult) {
     const findings = selfCheck.findings.map((finding) => finding.ruleId).join(", ");
     return findings ? `${baseReason} Triggered rules: ${findings}.` : baseReason;
+  }
+
+  private statusForVerification(verification: VerificationResult): TaskRun["status"] {
+    switch (verification.status) {
+      case "verified":
+        return "completed";
+      case "dispatched_unverified":
+        return "blocked";
+      case "failed":
+        return "failed";
+    }
   }
 
   private buildDenialExplanation(
@@ -997,15 +1072,7 @@ export class TaskOrchestrator {
       return templatePlan.plan;
     }
 
-    const plannerOutput = await this.modelRouter.prompt(
-      "planner",
-      [
-        `Create a compact plan for this task: ${request.text}`,
-        observation
-          ? `Current desktop context: active app ${observation.activeApp}; windows ${observation.windows.join(", ")}; candidates ${observation.candidates.map((candidate) => candidate.label).join(", ")}`
-          : "Current desktop context is not yet available."
-      ].join("\n")
-    );
+    const plannerOutput = await this.modelRouter.prompt("planner", buildPlannerPrompt(request.text, observation));
 
     const heuristicPlan = await this.buildHeuristicPlan(request.text, observation, plannerOutput);
     return heuristicPlan.length > 0
@@ -2452,67 +2519,238 @@ export class TaskOrchestrator {
     return /^(发送|send|上传|upload|删除|delete|付款|pay|提交|submit)$/i.test(targetLabel.trim());
   }
 
+  private async refineVerificationWithVision(
+    action: DesktopAction,
+    before: DesktopObservation | undefined,
+    after: DesktopObservation,
+    base: VerificationResult
+  ): Promise<VerificationResult> {
+    if (base.status === "verified") {
+      return base;
+    }
+
+    if (!this.shouldAttemptVisionVerification(action, after)) {
+      return base;
+    }
+
+    try {
+      const raw = await this.modelRouter.promptWithImage("vision", {
+        imagePath: after.screenshotPath!,
+        text: buildVisionVerificationPrompt({
+          action,
+          before,
+          after,
+          base,
+          focusedElementSummary: this.serializeObservationElement(after.focusedElement),
+          candidateSummaries: after.candidates
+            .slice(0, 12)
+            .map((candidate) => this.serializeObservationElement(candidate))
+            .filter(Boolean),
+          recentEventKinds: after.recentEvents?.map((event) => event.kind) ?? [],
+          textSummary:
+            (typeof action.args.text === "string" && action.args.text.trim()) ||
+            (typeof action.args.value === "string" && action.args.value.trim()) ||
+            undefined
+        }),
+        system: buildVisionVerificationSystemPrompt()
+      });
+      const candidate = this.parseVisionVerification(raw);
+      if (!candidate) {
+        return base;
+      }
+
+      if (candidate.status === "verified" && candidate.confidence >= 0.72) {
+        return this.verificationVerified(
+          candidate.message,
+          [
+            ...base.evidence,
+            `vision:${candidate.confidence.toFixed(2)}`,
+            ...(after.screenshotRef ? [`screenshotRef=${after.screenshotRef}`] : [])
+          ],
+          [
+            ...base.evidenceItems,
+            {
+              source: "vision",
+              kind: "verdict",
+              message: candidate.message,
+              confidence: candidate.confidence,
+              screenshotRef: after.screenshotRef
+            }
+          ]
+        );
+      }
+
+      if (candidate.status === "failed" && candidate.confidence >= 0.8) {
+        return this.verificationFailed(
+          candidate.message,
+          [
+            ...base.evidence,
+            `vision:${candidate.confidence.toFixed(2)}`,
+            ...(after.screenshotRef ? [`screenshotRef=${after.screenshotRef}`] : [])
+          ],
+          [
+            ...base.evidenceItems,
+            {
+              source: "vision",
+              kind: "verdict",
+              message: candidate.message,
+              confidence: candidate.confidence,
+              screenshotRef: after.screenshotRef
+            }
+          ]
+        );
+      }
+
+      if (base.status === "failed" && candidate.status === "dispatched_unverified" && candidate.confidence >= 0.6) {
+        return this.verificationUnverified(
+          candidate.message,
+          [
+            ...base.evidence,
+            `vision:${candidate.confidence.toFixed(2)}`,
+            ...(after.screenshotRef ? [`screenshotRef=${after.screenshotRef}`] : [])
+          ],
+          [
+            ...base.evidenceItems,
+            {
+              source: "vision",
+              kind: "verdict",
+              message: candidate.message,
+              confidence: candidate.confidence,
+              screenshotRef: after.screenshotRef
+            }
+          ]
+        );
+      }
+    } catch {
+      return base;
+    }
+
+    return base;
+  }
+
+  private shouldAttemptVisionVerification(action: DesktopAction, observation: DesktopObservation) {
+    if (!observation.screenshotPath) {
+      return false;
+    }
+
+    const supportedActionKinds = new Set([
+      "ui.open_app",
+      "ui.activate_app",
+      "ui.focus_target",
+      "ui.click_target",
+      "ui.type_into_target",
+      "ui.type_text",
+      "ui.paste_text",
+      "ui.hotkey",
+      "ui.scroll",
+      "ui.edit_existing",
+      "external.select_contact",
+      "external.upload_file"
+    ]);
+    return supportedActionKinds.has(action.kind);
+  }
+
+  private parseVisionVerification(raw: string) {
+    if (!raw || /^\[stub:[^\]]+\]/.test(raw.trim())) {
+      return undefined;
+    }
+
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) {
+      return undefined;
+    }
+
+    try {
+      const parsed = JSON.parse(match[0]) as {
+        confidence?: number;
+        message?: string;
+        status?: string;
+      };
+      if (!parsed || typeof parsed.message !== "string" || typeof parsed.status !== "string") {
+        return undefined;
+      }
+      if (!["verified", "dispatched_unverified", "failed"].includes(parsed.status)) {
+        return undefined;
+      }
+
+      return {
+        confidence:
+          typeof parsed.confidence === "number" && Number.isFinite(parsed.confidence)
+            ? Math.min(Math.max(parsed.confidence, 0), 1)
+            : 0.5,
+        message: parsed.message.trim(),
+        status: parsed.status as VerificationResult["status"]
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
   private verifyActionOutcome(
     action: DesktopAction,
     before: DesktopObservation | undefined,
     after: DesktopObservation,
     executionReport?: string
-  ): { ok: boolean; message: string } {
+  ): VerificationResult {
     switch (action.kind) {
       case "ui.open_app":
       case "ui.activate_app": {
         const rawApplicationName = this.resolveApplicationTarget(action);
         if (!rawApplicationName) {
           if (this.isMissingAppMatchExecution(executionReport)) {
-            return {
-              ok: false,
-              message: `${action.kind} could not resolve a concrete application target. Please specify the app name explicitly.`
-            };
+            return this.verificationFailed(
+              `${action.kind} could not resolve a concrete application target. Please specify the app name explicitly.`
+            );
           }
-          return {
-            ok: true,
-            message: `${action.kind} executed without an explicit application target.`
-          };
+          return this.verificationUnverified(`${action.kind} executed without an explicit application target.`);
         }
         const applicationName = this.canonicalizeApplicationName(rawApplicationName);
 
         const appIsActive = this.isApplicationVisibleInObservation(applicationName, after);
         if (appIsActive) {
-          return {
-            ok: true,
-            message: `${applicationName} is visible after ${action.kind}.`
-          };
+          return this.verificationVerified(`${applicationName} is visible after ${action.kind}.`, [
+            `activeApp=${after.activeApp}`,
+            `activeWindow=${after.activeWindowTitle ?? "unknown"}`
+          ]);
         }
 
         if (this.isLaunchAcknowledgedByBridge(action.kind, applicationName, executionReport)) {
-          return {
-            ok: true,
-            message: `Bridge acknowledged ${action.kind} for ${applicationName}; snapshot visibility check was inconclusive.`
-          };
+          return this.verificationVerified(
+            `Bridge acknowledged ${action.kind} for ${applicationName}; snapshot visibility check was inconclusive.`,
+            [`bridge=${executionReport ?? "acknowledged"}`]
+          );
         }
 
-        return {
-          ok: false,
-          message: `${applicationName} did not become visible after ${action.kind}.`
-        };
+        if (this.observationIncludesText(after, applicationName)) {
+          return this.verificationVerified(`${applicationName} appears in OCR text after ${action.kind}.`, [
+            `ocr=${applicationName}`
+          ]);
+        }
+
+        return this.verificationFailed(`${applicationName} did not become visible after ${action.kind}.`, [
+          `activeApp=${after.activeApp}`,
+          `windows=${after.windows.join(", ")}`
+        ]);
       }
       case "ui.focus_target":
       case "ui.click_target": {
         const targetLabel = this.resolveActionTargetLabel(action);
         const targetRole = this.resolveActionRole(action);
         if (!targetLabel) {
-          return {
-            ok: true,
-            message: `${action.kind} executed without a semantic target label.`
-          };
+          return this.verificationUnverified(`${action.kind} executed without a semantic target label.`);
+        }
+
+        if (this.focusedElementMatches(after, targetLabel, targetRole)) {
+          return this.verificationVerified(`Focused element now matches "${targetLabel}" after ${action.kind}.`, [
+            `focused=${after.focusedElement?.label ?? after.focusedElement?.id ?? "unknown"}`
+          ]);
         }
 
         const candidate = this.findCandidateByLabel(after, targetLabel, targetRole);
         if (candidate?.focused) {
-          return {
-            ok: true,
-            message: `Target "${targetLabel}" is focused after ${action.kind}.`
-          };
+          return this.verificationVerified(`Target "${targetLabel}" is focused after ${action.kind}.`, [
+            `candidate=${candidate.label}`
+          ]);
         }
 
         const windowChanged =
@@ -2520,72 +2758,97 @@ export class TaskOrchestrator {
           after.activeWindowTitle &&
           before.activeWindowTitle !== after.activeWindowTitle;
         if (windowChanged) {
-          return {
-            ok: true,
-            message: `Window context changed after interacting with "${targetLabel}".`
-          };
+          return this.verificationVerified(`Window context changed after interacting with "${targetLabel}".`, [
+            `before=${before?.activeWindowTitle ?? "unknown"}`,
+            `after=${after.activeWindowTitle ?? "unknown"}`
+          ]);
         }
 
-        return {
-          ok: false,
-          message: `Target "${targetLabel}" was not focused and no window change was observed after ${action.kind}.`
-        };
+        const focusEvent = this.findObservationEvent(after, ["focus.changed", "window.changed", "selection.changed"]);
+        if (focusEvent) {
+          return this.verificationVerified(`Observed ${focusEvent.kind} after interacting with "${targetLabel}".`, [
+            focusEvent.message
+          ]);
+        }
+
+        return this.verificationFailed(
+          `Target "${targetLabel}" was not focused and no window change was observed after ${action.kind}.`
+        );
       }
       case "ui.type_into_target": {
         const targetLabel = this.resolveActionTargetLabel(action);
         const targetRole = this.resolveActionRole(action);
         const text = this.resolveActionText(action);
         if (!targetLabel || !text) {
-          return {
-            ok: true,
-            message: `${action.kind} executed without enough semantic data to verify.`
-          };
+          return this.verificationUnverified(`${action.kind} executed without enough semantic data to verify.`);
         }
 
         const candidate = this.findCandidateByLabel(after, targetLabel, targetRole);
-        if (candidate?.value?.includes(text)) {
-          return {
-            ok: true,
-            message: `Target "${targetLabel}" now contains the requested text.`
-          };
+        const focusedValue = after.focusedElement?.value;
+        if (focusedValue?.includes(text)) {
+          return this.verificationVerified(
+            `Focused element now contains the requested text for "${targetLabel}".`,
+            [`focusedValue=${focusedValue}`]
+          );
         }
 
-        return {
-          ok: false,
-          message: `Target "${targetLabel}" does not show the requested text after input.`
-        };
+        if (candidate?.value?.includes(text)) {
+          return this.verificationVerified(`Target "${targetLabel}" now contains the requested text.`, [
+            `candidateValue=${candidate.value}`
+          ]);
+        }
+
+        const valueEvent = this.findObservationEvent(after, ["value.changed"]);
+        if (valueEvent) {
+          return this.verificationVerified(
+            `Observed value change after typing into "${targetLabel}", although the exact text was not readable.`,
+            [valueEvent.message]
+          );
+        }
+
+        if (this.observationIncludesText(after, text) || this.observationIncludesText(after, targetLabel)) {
+          return this.verificationVerified(
+            `OCR text suggests the requested input for "${targetLabel}" is now visible.`
+          );
+        }
+
+        return this.verificationFailed(`Target "${targetLabel}" does not show the requested text after input.`);
       }
       case "ui.type_text":
       case "ui.paste_text": {
         const text = this.resolveActionText(action);
         if (!text) {
-          return {
-            ok: true,
-            message: `${action.kind} executed without explicit text content to verify.`
-          };
+          return this.verificationUnverified(`${action.kind} executed without explicit text content to verify.`);
         }
 
         const focusedCandidate = after.candidates.find((candidate) => candidate.focused && candidate.value?.includes(text));
         const anyCandidate = after.candidates.find((candidate) => candidate.value?.includes(text));
-        if (focusedCandidate || anyCandidate) {
-          return {
-            ok: true,
-            message: "The requested text is visible in the post-action observation."
-          };
+        if (after.focusedElement?.value?.includes(text) || focusedCandidate || anyCandidate) {
+          return this.verificationVerified("The requested text is visible in the post-action observation.", [
+            `focused=${after.focusedElement?.label ?? "unknown"}`
+          ]);
         }
 
-        return {
-          ok: false,
-          message: "The requested text is not visible in any post-action input candidate."
-        };
+        const valueEvent = this.findObservationEvent(after, ["value.changed"]);
+        if (valueEvent) {
+          return this.verificationVerified(
+            "Observed a value-change event after text input, although the exact text was not readable.",
+            [valueEvent.message]
+          );
+        }
+
+        if (this.observationIncludesText(after, text)) {
+          return this.verificationVerified("OCR text suggests the requested text is visible after input.");
+        }
+
+        return this.verificationFailed("The requested text is not visible in any post-action input candidate.");
       }
       case "external.select_contact": {
         const contact = this.resolveActionContactName(action);
         if (!contact) {
-          return {
-            ok: false,
-            message: "Contact target is missing for external.select_contact. Provide an explicit contact name."
-          };
+          return this.verificationFailed(
+            "Contact target is missing for external.select_contact. Provide an explicit contact name."
+          );
         }
 
         const contactVisibleByWindow = [
@@ -2594,99 +2857,264 @@ export class TaskOrchestrator {
         ].some((value) => value.toLowerCase().includes(contact.toLowerCase()));
         const contactCandidate = this.findCandidateByLabel(after, contact);
         if (contactVisibleByWindow || contactCandidate?.focused || Boolean(contactCandidate)) {
-          return {
-            ok: true,
-            message: `Contact "${contact}" appears selected in post-action observation.`
-          };
+          return this.verificationVerified(`Contact "${contact}" appears selected in post-action observation.`, [
+            `activeWindow=${after.activeWindowTitle ?? "unknown"}`
+          ]);
+        }
+
+        if (this.observationIncludesText(after, contact)) {
+          return this.verificationVerified(`OCR text suggests contact "${contact}" is visible after selection.`);
         }
 
         if (this.isContactSelectionAcknowledgedByBridge(contact, executionReport)) {
-          return {
-            ok: true,
-            message: `Bridge acknowledged external.select_contact for "${contact}"; snapshot visibility check was inconclusive.`
-          };
+          return this.verificationUnverified(
+            `Bridge acknowledged external.select_contact for "${contact}", but the UI selection still needs confirmation.`,
+            [`bridge=${executionReport ?? "acknowledged"}`]
+          );
         }
 
-        return {
-          ok: false,
-          message: `Contact "${contact}" is not visible after contact selection.`
-        };
+        return this.verificationFailed(`Contact "${contact}" is not visible after contact selection.`);
       }
       case "external.upload_file": {
         const filePath = this.resolveActionFilePath(action);
         const normalizedReport = executionReport?.trim().toLowerCase() ?? "";
 
         if (normalizedReport.startsWith("uploaded-file:")) {
-          return {
-            ok: true,
-            message: filePath
-              ? `File "${filePath}" upload was dispatched after approval.`
-              : "File upload was dispatched after approval."
-          };
+          return this.verificationUnverified(
+            filePath
+              ? `File "${filePath}" upload was dispatched after approval, but the UI still needs confirmation.`
+              : "File upload was dispatched after approval, but the UI still needs confirmation.",
+            [`bridge=${executionReport ?? normalizedReport}`]
+          );
         }
 
         if (normalizedReport === "stubbed:external.upload_file") {
-          return {
-            ok: true,
-            message: "Upload action was dispatched by stub bridge (dry-run)."
-          };
+          return this.verificationUnverified("Upload action was dispatched by stub bridge (dry-run).", [
+            "bridge=stubbed"
+          ]);
         }
 
         if (normalizedReport.startsWith("noop:file-not-found")) {
-          return {
-            ok: false,
-            message: filePath
-              ? `File "${filePath}" was not found on disk.`
-              : "Upload target file was not found on disk."
-          };
+          return this.verificationFailed(
+            filePath ? `File "${filePath}" was not found on disk.` : "Upload target file was not found on disk."
+          );
         }
 
         if (normalizedReport.startsWith("noop:file-picker-not-ready")) {
-          return {
-            ok: false,
-            message: "File picker is not ready. Open attachment/file chooser first, then retry."
-          };
+          return this.verificationFailed("File picker is not ready. Open attachment/file chooser first, then retry.");
         }
 
         if (normalizedReport.startsWith("noop:no-file-path")) {
-          return {
-            ok: false,
-            message: "Upload action is missing file path. Provide an explicit file path or filename."
-          };
+          return this.verificationFailed(
+            "Upload action is missing file path. Provide an explicit file path or filename."
+          );
         }
 
-        return {
-          ok: true,
-          message: executionReport
-            ? `Upload action executed: ${executionReport}`
-            : "Upload action executed."
-        };
+        const fileName = filePath?.split(/[\\/]/).at(-1)?.toLowerCase();
+        const fileVisibleInObservation =
+          Boolean(fileName) &&
+          [
+            after.activeWindowTitle ?? "",
+            ...after.windows,
+            ...after.candidates.flatMap((candidate) => [candidate.label, candidate.value ?? ""])
+          ].some((value) => value.toLowerCase().includes(fileName!));
+        if (fileVisibleInObservation) {
+          return this.verificationVerified(
+            filePath
+              ? `File "${filePath}" is visible in the post-action observation.`
+              : "Selected upload file is visible in the post-action observation.",
+            [`activeWindow=${after.activeWindowTitle ?? "unknown"}`]
+          );
+        }
+
+        if (fileName && this.observationIncludesText(after, fileName)) {
+          return this.verificationVerified(
+            filePath
+              ? `OCR text suggests file "${filePath}" is visible after upload preparation.`
+              : "OCR text suggests the selected upload file is visible."
+          );
+        }
+
+        return this.verificationUnverified(
+          executionReport ? `Upload action executed: ${executionReport}` : "Upload action executed."
+        );
       }
       case "ui.hotkey": {
         const keys =
           (typeof action.args.keys === "string" ? action.args.keys : undefined) ??
           (typeof action.args.hotkey === "string" ? action.args.hotkey : undefined);
-        return {
-          ok: true,
-          message: keys ? `Hotkey "${keys}" dispatched.` : "Hotkey dispatched."
-        };
+        if (this.hasMeaningfulObservationDiff(before, after)) {
+          return this.verificationVerified(
+            keys ? `Hotkey "${keys}" dispatched and the desktop state changed.` : "Hotkey dispatched and the desktop state changed."
+          );
+        }
+
+        const hotkeyEvent = this.findObservationEvent(after, ["window.changed", "focus.changed", "selection.changed"]);
+        if (hotkeyEvent) {
+          return this.verificationVerified(
+            keys ? `Hotkey "${keys}" dispatched and generated ${hotkeyEvent.kind}.` : `Hotkey dispatched and generated ${hotkeyEvent.kind}.`,
+            [hotkeyEvent.message]
+          );
+        }
+
+        return this.verificationUnverified(
+          keys
+            ? `Hotkey "${keys}" dispatched, but post-action state was not directly verifiable. Confirm the desktop state before continuing.`
+            : "Hotkey dispatched, but post-action state was not directly verifiable. Confirm the desktop state before continuing."
+        );
       }
       case "ui.scroll": {
         const direction = typeof action.args.direction === "string" ? action.args.direction : "unknown";
         const amount = typeof action.args.amount === "string" ? action.args.amount : undefined;
-        return {
-          ok: true,
-          message: amount
-            ? `Scroll dispatched (${direction}, amount=${amount}).`
-            : `Scroll dispatched (${direction}).`
-        };
+        if (this.hasMeaningfulObservationDiff(before, after)) {
+          return this.verificationVerified(
+            amount
+              ? `Scroll changed the observed desktop state (${direction}, amount=${amount}).`
+              : `Scroll changed the observed desktop state (${direction}).`
+          );
+        }
+
+        const scrollEvent = this.findObservationEvent(after, ["value.changed", "selection.changed", "window.changed"]);
+        if (scrollEvent) {
+          return this.verificationVerified(
+            amount
+              ? `Scroll triggered ${scrollEvent.kind} (${direction}, amount=${amount}).`
+              : `Scroll triggered ${scrollEvent.kind} (${direction}).`,
+            [scrollEvent.message]
+          );
+        }
+
+        return this.verificationUnverified(
+          amount
+            ? `Scroll dispatched (${direction}, amount=${amount}), but post-action state was not directly verifiable. Confirm the desktop state before continuing.`
+            : `Scroll dispatched (${direction}), but post-action state was not directly verifiable. Confirm the desktop state before continuing.`
+        );
       }
       default:
-        return {
-          ok: true,
-          message: `${action.kind} executed.`
-        };
+        return this.hasMeaningfulObservationDiff(before, after)
+          ? this.verificationVerified(`${action.kind} executed and changed the observed desktop state.`)
+          : this.verificationUnverified(
+              `${action.kind} executed, but the post-action desktop state was not directly verifiable.`
+            );
     }
+  }
+
+  private verificationVerified(
+    message: string,
+    evidence: string[] = [],
+    evidenceItems: VerificationEvidenceItem[] = []
+  ): VerificationResult {
+    return {
+      status: "verified",
+      message,
+      evidence,
+      evidenceItems: this.mergeEvidenceItems(evidence, evidenceItems)
+    };
+  }
+
+  private verificationUnverified(
+    message: string,
+    evidence: string[] = [],
+    evidenceItems: VerificationEvidenceItem[] = []
+  ): VerificationResult {
+    return {
+      status: "dispatched_unverified",
+      message,
+      evidence,
+      evidenceItems: this.mergeEvidenceItems(evidence, evidenceItems)
+    };
+  }
+
+  private verificationFailed(
+    message: string,
+    evidence: string[] = [],
+    evidenceItems: VerificationEvidenceItem[] = []
+  ): VerificationResult {
+    return {
+      status: "failed",
+      message,
+      evidence,
+      evidenceItems: this.mergeEvidenceItems(evidence, evidenceItems)
+    };
+  }
+
+  private mergeEvidenceItems(evidence: string[], evidenceItems: VerificationEvidenceItem[]) {
+    const merged = [
+      ...evidence.map((entry) => this.parseEvidenceItem(entry)),
+      ...evidenceItems
+    ];
+
+    const deduped = new Map<string, VerificationEvidenceItem>();
+    for (const item of merged) {
+      const key = [
+        item.source,
+        item.kind,
+        item.field ?? "",
+        item.value ?? "",
+        item.screenshotRef ?? "",
+        item.message
+      ].join("|");
+      if (!deduped.has(key)) {
+        deduped.set(key, item);
+      }
+    }
+    return [...deduped.values()];
+  }
+
+  private parseEvidenceItem(entry: string): VerificationEvidenceItem {
+    const normalized = entry.trim();
+    const [prefix, rawValue] = normalized.split("=", 2);
+    if (prefix === "bridge") {
+      return {
+        source: "bridge",
+        kind: "ack",
+        field: "bridge",
+        message: normalized,
+        value: rawValue
+      };
+    }
+    if (prefix === "ocr") {
+      return {
+        source: "ocr",
+        kind: "text_match",
+        field: "ocr",
+        message: normalized,
+        value: rawValue
+      };
+    }
+    if (prefix === "activeApp" || prefix === "activeWindow" || prefix === "focused" || prefix === "candidate" || prefix === "focusedValue" || prefix === "candidateValue" || prefix === "before" || prefix === "after" || prefix === "windows") {
+      return {
+        source: "local",
+        kind: "state",
+        field: prefix,
+        message: normalized,
+        value: rawValue
+      };
+    }
+    if (prefix === "screenshotRef") {
+      return {
+        source: "vision",
+        kind: "screenshot",
+        field: "screenshotRef",
+        message: normalized,
+        screenshotRef: rawValue,
+        value: rawValue
+      };
+    }
+    if (normalized.startsWith("vision:")) {
+      const confidence = Number.parseFloat(normalized.slice("vision:".length));
+      return {
+        source: "vision",
+        kind: "confidence",
+        message: normalized,
+        confidence: Number.isFinite(confidence) ? Math.min(Math.max(confidence, 0), 1) : undefined
+      };
+    }
+    return {
+      source: normalized.includes(".changed") ? "event" : "local",
+      kind: normalized.includes(".changed") ? "event" : "note",
+      message: normalized
+    };
   }
 
   private resolveApplicationTarget(action: DesktopAction) {
@@ -2814,6 +3242,113 @@ export class TaskOrchestrator {
       observation.candidates.find((candidate) => this.normalize(candidate.label) === normalizedTarget) ??
       observation.candidates.find((candidate) => this.normalize(candidate.label).includes(normalizedTarget))
     );
+  }
+
+  private focusedElementMatches(observation: DesktopObservation | undefined, label: string, preferredRole?: string) {
+    const focused = observation?.focusedElement;
+    if (!focused) {
+      return false;
+    }
+
+    const normalizedTarget = this.normalize(label);
+    const normalizedFocusedLabel = this.normalize(focused.label);
+    const focusedRole = this.normalizeRoleName(focused.role);
+    const normalizedRole = this.normalizeRoleName(preferredRole);
+
+    const labelMatches =
+      normalizedFocusedLabel === normalizedTarget ||
+      normalizedFocusedLabel.includes(normalizedTarget) ||
+      normalizedTarget.includes(normalizedFocusedLabel);
+    return labelMatches && this.roleMatches(focusedRole, normalizedRole);
+  }
+
+  private hasMeaningfulObservationDiff(before: DesktopObservation | undefined, after: DesktopObservation) {
+    if (!before) {
+      return true;
+    }
+
+    if (before.activeApp !== after.activeApp || before.activeWindowTitle !== after.activeWindowTitle) {
+      return true;
+    }
+
+    const beforeFocused = this.serializeObservationElement(before.focusedElement);
+    const afterFocused = this.serializeObservationElement(after.focusedElement);
+    if (beforeFocused !== afterFocused) {
+      return true;
+    }
+
+    const beforeFocusedCandidates = before.candidates
+      .filter((candidate) => candidate.focused)
+      .map((candidate) => this.serializeObservationElement(candidate))
+      .join("|");
+    const afterFocusedCandidates = after.candidates
+      .filter((candidate) => candidate.focused)
+      .map((candidate) => this.serializeObservationElement(candidate))
+      .join("|");
+    if (beforeFocusedCandidates !== afterFocusedCandidates) {
+      return true;
+    }
+
+    if (before.ocrText.join("|") !== after.ocrText.join("|")) {
+      return true;
+    }
+
+    return before.windows.join("|") !== after.windows.join("|");
+  }
+
+  private observationIncludesText(observation: DesktopObservation | undefined, text: string) {
+    if (!observation) {
+      return false;
+    }
+
+    const normalizedTarget = this.normalize(text);
+    if (!normalizedTarget) {
+      return false;
+    }
+
+    const ocrMatch = observation.ocrText.some((entry) => this.normalize(entry).includes(normalizedTarget));
+    if (ocrMatch) {
+      return true;
+    }
+
+    return observation.candidates.some((candidate) => {
+      const label = this.normalize(candidate.label);
+      const value = this.normalize(candidate.value ?? "");
+      return (
+        candidate.source === "ocr" &&
+        (label.includes(normalizedTarget) || value.includes(normalizedTarget))
+      );
+    });
+  }
+
+  private findObservationEvent(observation: DesktopObservation | undefined, kinds: string[]) {
+    if (!observation) {
+      return undefined;
+    }
+
+    const allowed = new Set(kinds.map((kind) => kind.toLowerCase()));
+    return [...(observation.recentEvents ?? [])]
+      .reverse()
+      .find((event) => allowed.has(event.kind.toLowerCase()));
+  }
+
+  private serializeObservationElement(
+    element:
+      | DesktopObservation["focusedElement"]
+      | DesktopObservation["candidates"][number]
+      | undefined
+  ) {
+    if (!element) {
+      return "";
+    }
+
+    return [
+      element.id,
+      this.normalizeRoleName(element.role) ?? "",
+      this.normalize(element.label),
+      element.value ?? "",
+      element.focused ? "1" : "0"
+    ].join("|");
   }
 
   private normalizeRoleName(role: string | undefined) {

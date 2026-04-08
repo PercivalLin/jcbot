@@ -24,8 +24,9 @@ export async function promptOpenAICompatibleViaCurl(options: {
   apiKey?: string;
   profile: ModelProfile;
   prompt: string;
+  timeoutMs: number;
 }) {
-  const { apiKey, profile, prompt } = options;
+  const { apiKey, profile, prompt, timeoutMs } = options;
   if (profile.provider !== "openai-compatible") {
     throw new Error("profile provider must be openai-compatible for curl fallback");
   }
@@ -45,6 +46,7 @@ export async function promptOpenAICompatibleViaCurl(options: {
   const response = await postViaCurl({
     apiKey,
     payloadText,
+    timeoutMs,
     url: endpoint
   });
 
@@ -91,18 +93,23 @@ export async function promptOpenAICompatibleViaCurl(options: {
 async function postViaCurl(options: {
   apiKey?: string;
   payloadText: string;
+  timeoutMs: number;
   url: string;
 }): Promise<CurlResponse> {
-  const { apiKey, payloadText, url } = options;
+  const { apiKey, payloadText, timeoutMs, url } = options;
+  const boundedTimeoutMs = Math.max(1_000, timeoutMs);
+  const seconds = Math.max(1, Math.ceil(boundedTimeoutMs / 1000));
   const args = [
     "--silent",
     "--show-error",
     "--max-time",
-    "30",
+    String(seconds),
     "--request",
     "POST",
     "--header",
-    "content-type: application/json; charset=utf-8"
+    "content-type: application/json; charset=utf-8",
+    "--connect-timeout",
+    String(Math.max(1, Math.min(8, seconds)))
   ];
 
   if (apiKey?.trim()) {
@@ -131,7 +138,7 @@ async function postViaCurl(options: {
     url
   );
 
-  const { code, stderr, stdout } = await spawnAndCollect("curl", args);
+  const { code, stderr, stdout } = await spawnAndCollect("curl", args, boundedTimeoutMs);
   if (code !== 0) {
     const detail = stderr.trim() || truncateBody(stdout);
     throw new Error(`openai-compatible curl request failed (exit=${code}): ${detail}`);
@@ -169,7 +176,7 @@ function resolveProxyUrl() {
   return undefined;
 }
 
-function spawnAndCollect(command: string, args: string[]) {
+function spawnAndCollect(command: string, args: string[], timeoutMs: number) {
   return new Promise<{
     code: number | null;
     stderr: string;
@@ -180,6 +187,37 @@ function spawnAndCollect(command: string, args: string[]) {
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    let forceKillHandle: NodeJS.Timeout | undefined;
+
+    const finishResolve = (value: { code: number | null; stderr: string; stdout: string }) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+      if (forceKillHandle) {
+        clearTimeout(forceKillHandle);
+      }
+      resolve(value);
+    };
+
+    const finishReject = (error: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+      if (forceKillHandle) {
+        clearTimeout(forceKillHandle);
+      }
+      reject(error);
+    };
 
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -191,8 +229,22 @@ function spawnAndCollect(command: string, args: string[]) {
       stderr += chunk;
     });
 
-    child.on("error", (error) => reject(error));
-    child.on("close", (code) => resolve({ code, stderr, stdout }));
+    timeoutHandle = setTimeout(() => {
+      child.kill("SIGTERM");
+      forceKillHandle = setTimeout(() => {
+        child.kill("SIGKILL");
+      }, 1_000);
+      forceKillHandle.unref?.();
+      finishReject(new Error(`openai-compatible curl request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timeoutHandle.unref?.();
+
+    child.on("error", (error) => {
+      finishReject(error instanceof Error ? error : new Error(String(error)));
+    });
+    child.on("close", (code) => {
+      finishResolve({ code, stderr, stdout });
+    });
   });
 }
 

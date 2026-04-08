@@ -1,13 +1,13 @@
-import type { TaskRequest, TaskRun } from "@lobster/shared";
-import type { ApprovalTicket } from "@lobster/shared";
+import { randomUUID } from "node:crypto";
+import type { ApprovalTicket, MessageBinding, RunEvent, TaskRequest, TaskRun } from "@lobster/shared";
+import type { RuntimePersistence } from "@lobster/storage";
 import type { TelegramRuntimeConfig } from "./telegramConfig.js";
-import { postTelegramJson } from "./telegramHttp.js";
-import { NoopRuntimeNotifier, type RuntimeNotifier } from "./runtimeNotifier.js";
-
-type TelegramSendResponse = {
-  description?: string;
-  ok: boolean;
-};
+import {
+  editTelegramTextMessage,
+  sendTelegramTextMessage,
+  type TelegramInlineKeyboardMarkup
+} from "./telegramHttp.js";
+import type { RuntimeNotifier } from "./runtimeNotifier.js";
 
 type RuntimeTaskBundle = {
   approvalTicket?: ApprovalTicket;
@@ -15,53 +15,57 @@ type RuntimeTaskBundle = {
 };
 
 class TelegramBotClient {
-  constructor(
-    private readonly options: {
-      baseUrl: string;
-      botToken: string;
-    }
-  ) {}
+  constructor(private readonly getOptions: () => { baseUrl: string; botToken?: string }) {}
 
-  async sendText(chatId: string, text: string) {
-    const response = await postTelegramJson<TelegramSendResponse>(
-      `${this.options.baseUrl}/bot${this.options.botToken}/sendMessage`,
-      {
-        chat_id: chatId,
-        text
-      },
-      {
-        timeoutMs: 15000
-      }
-    );
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Telegram sendMessage failed with HTTP ${response.status}.`);
+  async sendText(chatId: string, text: string, replyMarkup?: TelegramInlineKeyboardMarkup) {
+    const options = this.getOptions();
+    if (!options.botToken) {
+      return { messageId: "" };
     }
-    const payload = response.payload;
-    if (!payload.ok) {
-      throw new Error(`Telegram sendMessage failed: ${payload.description ?? "unknown error"}`);
+    return sendTelegramTextMessage({
+      baseUrl: options.baseUrl,
+      botToken: options.botToken,
+      chatId,
+      text,
+      replyMarkup
+    });
+  }
+
+  async editText(chatId: string, messageId: string, text: string, replyMarkup?: TelegramInlineKeyboardMarkup) {
+    const options = this.getOptions();
+    if (!options.botToken) {
+      throw new Error("Telegram bot token is not configured.");
     }
+    return editTelegramTextMessage({
+      baseUrl: options.baseUrl,
+      botToken: options.botToken,
+      chatId,
+      messageId,
+      text,
+      replyMarkup
+    });
   }
 }
 
 class TelegramRuntimeNotifier implements RuntimeNotifier {
-  constructor(private readonly client: TelegramBotClient) {}
+  constructor(
+    private readonly client: TelegramBotClient,
+    private readonly persistence: RuntimePersistence
+  ) {}
 
   async notifyApprovalRequested(request: TaskRequest, bundle: RuntimeTaskBundle) {
     if (request.source !== "telegram" || !bundle.approvalTicket) {
       return;
     }
 
-    await this.client.sendText(
-      request.userId,
-      [
-        "Lobster needs approval before continuing.",
-        `Task: ${request.text}`,
-        `Action: ${bundle.approvalTicket.action.kind}`,
-        `Reason: ${bundle.approvalTicket.reason}`,
-        `Ticket: ${bundle.approvalTicket.id}`,
-        "Reply: /approve <ticketId> or /deny <ticketId>"
-      ].join("\n")
-    );
+    await this.upsertStatusCard(request, bundle.run, bundle.approvalTicket, {
+      eventId: randomUUID(),
+      runId: bundle.run.runId,
+      kind: "approval.requested",
+      status: bundle.run.status,
+      message: bundle.approvalTicket.reason,
+      createdAt: new Date().toISOString()
+    });
   }
 
   async notifyApprovalResolved(
@@ -73,14 +77,22 @@ class TelegramRuntimeNotifier implements RuntimeNotifier {
       return;
     }
 
-    await this.client.sendText(
-      request.userId,
-      [
-        `Lobster ${decision === "approved" ? "received approval" : "cancelled the task after denial"}.`,
-        `Task: ${request.text}`,
-        `Status: ${bundle.run.status}`
-      ].join("\n")
-    );
+    await this.upsertStatusCard(request, bundle.run, undefined, {
+      eventId: randomUUID(),
+      runId: bundle.run.runId,
+      kind: "approval.resolved",
+      status: bundle.run.status,
+      message: decision === "approved" ? "Approval received." : "Approval denied.",
+      createdAt: new Date().toISOString()
+    });
+  }
+
+  async notifyRunEvent(request: TaskRequest, run: TaskRun, event: RunEvent) {
+    if (request.source !== "telegram") {
+      return;
+    }
+
+    await this.upsertStatusCard(request, run, undefined, event);
   }
 
   async notifyRunSettled(request: TaskRequest, run: TaskRun) {
@@ -88,42 +100,205 @@ class TelegramRuntimeNotifier implements RuntimeNotifier {
       return;
     }
 
-    const lines = [`Lobster ${describeRunStatus(run.status)}.`, `Task: ${request.text}`, `Status: ${run.status}`];
-    if (run.outcomeSummary) {
-      lines.push(`Summary: ${run.outcomeSummary}`);
-    }
-    if (!run.outcomeSummary && run.selfCheck?.explanation && run.status !== "completed") {
-      lines.push(`Reason: ${run.selfCheck.explanation}`);
+    await this.upsertStatusCard(request, run, undefined, {
+      eventId: randomUUID(),
+      runId: run.runId,
+      kind: "run.settled",
+      status: run.status,
+      message: run.outcomeSummary ?? describeRunStatus(run.status),
+      createdAt: new Date().toISOString()
+    });
+  }
+
+  private async upsertStatusCard(
+    request: TaskRequest,
+    run: TaskRun,
+    approvalTicket: ApprovalTicket | undefined,
+    event: RunEvent
+  ) {
+    const binding = await this.persistence.getMessageBinding(run.runId, "telegram", "status_card");
+    const nextText = buildTaskCard({
+      approvalTicket,
+      event,
+      request,
+      run
+    });
+    const markup = buildApprovalMarkup(approvalTicket);
+
+    if (!binding) {
+      const sent = await this.client.sendText(request.userId, nextText, markup);
+      const createdAt = new Date().toISOString();
+      if (!sent.messageId) {
+        return;
+      }
+      const nextBinding: MessageBinding = {
+        id: randomUUID(),
+        channel: "telegram",
+        runId: run.runId,
+        chatId: request.userId,
+        messageId: sent.messageId,
+        mode: "status_card",
+        createdAt,
+        updatedAt: createdAt
+      };
+      await this.persistence.saveMessageBinding(nextBinding);
+      return;
     }
 
-    await this.client.sendText(request.userId, lines.join("\n"));
+    try {
+      await this.client.editText(binding.chatId, binding.messageId, nextText, markup);
+      await this.persistence.saveMessageBinding({
+        ...binding,
+        updatedAt: new Date().toISOString()
+      });
+      return;
+    } catch (error) {
+      if (isNoopEdit(error)) {
+        await this.persistence.saveMessageBinding({
+          ...binding,
+          updatedAt: new Date().toISOString()
+        });
+        return;
+      }
+
+      const sent = await this.client.sendText(request.userId, nextText, markup);
+      if (!sent.messageId) {
+        return;
+      }
+      const reboundAt = new Date().toISOString();
+      await this.persistence.saveMessageBinding({
+        ...binding,
+        chatId: request.userId,
+        messageId: sent.messageId,
+        updatedAt: reboundAt
+      });
+    }
   }
 }
 
-export function createTelegramRuntimeNotifierFromEnv(config: TelegramRuntimeConfig): RuntimeNotifier {
-  if (!config.botToken) {
-    return new NoopRuntimeNotifier();
+export function createTelegramRuntimeNotifierFromEnv(
+  getConfig: () => TelegramRuntimeConfig,
+  persistence: RuntimePersistence
+): RuntimeNotifier {
+  return new TelegramRuntimeNotifier(
+    new TelegramBotClient(() => ({
+      botToken: getConfig().botToken,
+      baseUrl: getConfig().baseUrl.replace(/\/$/, "")
+    })),
+    persistence
+  );
+}
+
+function buildTaskCard(params: {
+  approvalTicket?: ApprovalTicket;
+  event: RunEvent;
+  request: TaskRequest;
+  run: TaskRun;
+}) {
+  const { approvalTicket, event, request, run } = params;
+  const currentStep = run.currentStepId ? run.plan.find((step) => step.id === run.currentStepId) : undefined;
+  const currentIndex = currentStep ? run.plan.findIndex((step) => step.id === currentStep.id) + 1 : 0;
+  const totalSteps = run.plan.length;
+
+  const lines = [
+    `Lobster Task ${shortId(run.runId)}`,
+    `Status: ${run.status}`,
+    totalSteps > 0 ? `Step: ${currentIndex}/${totalSteps}${currentStep ? ` - ${currentStep.title}` : ""}` : "Step: pending",
+    `Task: ${request.text}`
+  ];
+
+  if (event.message.trim()) {
+    lines.push(`Update: ${event.message.trim()}`);
+  }
+  if (!event.message.trim() && run.outcomeSummary?.trim()) {
+    lines.push(`Summary: ${run.outcomeSummary.trim()}`);
   }
 
-  return new TelegramRuntimeNotifier(
-    new TelegramBotClient({
-      botToken: config.botToken,
-      baseUrl: config.baseUrl.replace(/\/$/, "")
-    })
-  );
+  if (run.verification) {
+    lines.push(`Verification: ${run.verification.status}`);
+    lines.push(`Why: ${run.verification.message}`);
+    const evidenceSources = Array.from(new Set(run.verification.evidenceItems.map((item) => item.source)));
+    const visionEvidence = run.verification.evidenceItems.find((item) => item.source === "vision");
+    if (evidenceSources.length > 0) {
+      lines.push(`Evidence: ${evidenceSources.join(" + ")}`);
+    } else if (run.verification.evidence.length > 0) {
+      lines.push(`Evidence: ${run.verification.evidence.slice(0, 2).join(" | ")}`);
+    }
+    if (visionEvidence?.confidence !== undefined) {
+      lines.push(`Vision: ${visionEvidence.confidence.toFixed(2)}`);
+    }
+    if (visionEvidence?.screenshotRef) {
+      lines.push(`Shot: ${visionEvidence.screenshotRef}`);
+    }
+  }
+
+  if (run.latestObservation) {
+    lines.push(
+      `Observed: ${run.latestObservation.activeApp}${
+        run.latestObservation.activeWindowTitle ? ` / ${run.latestObservation.activeWindowTitle}` : ""
+      }`
+    );
+    if (run.latestObservation.focusedElement?.label) {
+      lines.push(`Focused: ${run.latestObservation.focusedElement.label}`);
+    }
+    if (run.latestObservation.ocrText.length > 0) {
+      lines.push(`OCR: ${run.latestObservation.ocrText.slice(0, 2).join(", ")}`);
+    }
+  }
+
+  if (approvalTicket) {
+    lines.push(`Approval: waiting (${approvalTicket.id})`);
+    lines.push(`Action: ${approvalTicket.action.kind}`);
+  } else if (run.status === "awaiting_approval") {
+    lines.push("Approval: waiting");
+  } else {
+    lines.push("Approval: none");
+  }
+
+  return lines.join("\n");
+}
+
+function buildApprovalMarkup(approvalTicket?: ApprovalTicket): TelegramInlineKeyboardMarkup | undefined {
+  if (!approvalTicket || approvalTicket.state !== "pending") {
+    return undefined;
+  }
+
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "Approve once",
+          callback_data: `tg:approve:${approvalTicket.id}`
+        },
+        {
+          text: "Deny",
+          callback_data: `tg:deny:${approvalTicket.id}`
+        }
+      ]
+    ]
+  };
 }
 
 function describeRunStatus(status: TaskRun["status"]) {
   switch (status) {
     case "completed":
-      return "completed the task";
+      return "Completed.";
     case "blocked":
-      return "refused the task";
+      return "Blocked.";
     case "awaiting_approval":
-      return "is waiting for approval";
+      return "Waiting for approval.";
     case "failed":
-      return "failed the task";
+      return "Failed.";
     default:
-      return `updated task state to ${status}`;
+      return `State changed to ${status}.`;
   }
+}
+
+function shortId(value: string) {
+  return value.slice(0, 8);
+}
+
+function isNoopEdit(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /message is not modified/i.test(message);
 }

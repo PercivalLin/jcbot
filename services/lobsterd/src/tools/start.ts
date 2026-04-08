@@ -1,36 +1,19 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { stdin } from "node:process";
 import { loadRuntimeEnvFile } from "../modules/runtimeEnv.js";
-import { getBootstrapStatus, runBootstrapWizard } from "./bootstrap.js";
+import { getBootstrapStatus } from "./bootstrap.js";
 
 export async function startWithBootstrap() {
   loadRuntimeEnvFile();
 
   const status = getBootstrapStatus();
   if (!status.isReady) {
-    if (!stdin.isTTY) {
-      console.error("Lobster bootstrap is not ready:");
-      for (const item of status.missing) {
-        console.error(`- ${item}`);
-      }
-      console.error("Run `pnpm --filter lobsterd run init` in an interactive shell first.");
-      process.exitCode = 1;
-      return;
+    console.log("检测到尚未完成初始化，Lobster 将以 setup mode 启动。");
+    for (const item of status.missing) {
+      console.log(`- ${item}`);
     }
-
-    console.log("首次启动检测到尚未完成配置，进入 Bootstrap 向导。");
+    console.log("打开本地管理面完成配置，或使用 `pnpm --filter lobsterd run init` 进入 CLI 向导。");
     console.log("");
-    try {
-      await runBootstrapWizard();
-    } catch (error) {
-      if (isAbortError(error)) {
-        console.log("Bootstrap cancelled.");
-        process.exitCode = 130;
-        return;
-      }
-      throw error;
-    }
   }
 
   loadRuntimeEnvFile();
@@ -47,8 +30,4 @@ if (isDirectExecution) {
     console.error(error);
     process.exitCode = 1;
   });
-}
-
-function isAbortError(error: unknown) {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "ABORT_ERR";
 }

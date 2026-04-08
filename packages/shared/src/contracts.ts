@@ -17,8 +17,17 @@ export const taskStatusSchema = z.enum([
 ]);
 export type TaskStatus = z.infer<typeof taskStatusSchema>;
 
-export const taskSourceSchema = z.enum(["telegram", "inbox", "notification", "system"]);
+export const taskSourceSchema = z.enum(["telegram", "inbox", "notification", "system", "local"]);
 export type TaskSource = z.infer<typeof taskSourceSchema>;
+
+export const executionChannelSchema = z.enum([
+  "system_api",
+  "apple_event",
+  "ax_action",
+  "cg_event",
+  "visual_verify"
+]);
+export type ExecutionChannel = z.infer<typeof executionChannelSchema>;
 
 export const selfCheckFindingSchema = z.object({
   ruleId: z.string(),
@@ -56,6 +65,14 @@ export const uiCandidateSchema = z.object({
 });
 export type UiCandidate = z.infer<typeof uiCandidateSchema>;
 
+export const desktopObservationEventSchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  message: z.string(),
+  createdAt: z.string()
+});
+export type DesktopObservationEvent = z.infer<typeof desktopObservationEventSchema>;
+
 export const desktopObservationSchema = z.object({
   screenshotRef: z.string(),
   activeApp: z.string(),
@@ -63,6 +80,11 @@ export const desktopObservationSchema = z.object({
   ocrText: z.array(z.string()).default([]),
   windows: z.array(z.string()).default([]),
   axTreeRef: z.string().optional(),
+  snapshotAt: z.string().optional(),
+  screenshotPath: z.string().optional(),
+  observationMode: z.enum(["accessibility", "visual", "hybrid", "stub"]).optional(),
+  focusedElement: uiCandidateSchema.optional(),
+  recentEvents: z.array(desktopObservationEventSchema).optional(),
   candidates: z.array(uiCandidateSchema).default([])
 });
 export type DesktopObservation = z.infer<typeof desktopObservationSchema>;
@@ -121,6 +143,28 @@ export const approvalTicketSchema = z.object({
 });
 export type ApprovalTicket = z.infer<typeof approvalTicketSchema>;
 
+export const verificationResultStatusSchema = z.enum(["verified", "dispatched_unverified", "failed"]);
+export type VerificationResultStatus = z.infer<typeof verificationResultStatusSchema>;
+
+export const verificationEvidenceItemSchema = z.object({
+  source: z.enum(["local", "ocr", "vision", "bridge", "event"]),
+  kind: z.string(),
+  message: z.string(),
+  confidence: z.number().min(0).max(1).optional(),
+  screenshotRef: z.string().optional(),
+  field: z.string().optional(),
+  value: z.string().optional()
+});
+export type VerificationEvidenceItem = z.infer<typeof verificationEvidenceItemSchema>;
+
+export const verificationResultSchema = z.object({
+  status: verificationResultStatusSchema,
+  message: z.string(),
+  evidence: z.array(z.string()).default([]),
+  evidenceItems: z.array(verificationEvidenceItemSchema).default([])
+});
+export type VerificationResult = z.infer<typeof verificationResultSchema>;
+
 export const taskRunSchema = z.object({
   runId: z.string(),
   request: taskRequestSchema,
@@ -129,11 +173,47 @@ export const taskRunSchema = z.object({
   plan: z.array(planStepSchema),
   currentStepId: z.string().optional(),
   selfCheck: selfCheckResultSchema.optional(),
+  verification: verificationResultSchema.optional(),
+  latestObservation: desktopObservationSchema.optional(),
   outcomeSummary: z.string().optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
 export type TaskRun = z.infer<typeof taskRunSchema>;
+
+export const runEventKindSchema = z.enum([
+  "run.created",
+  "run.status_changed",
+  "run.step_advanced",
+  "approval.requested",
+  "approval.resolved",
+  "run.settled",
+  "run.note"
+]);
+export type RunEventKind = z.infer<typeof runEventKindSchema>;
+
+export const runEventSchema = z.object({
+  eventId: z.string(),
+  runId: z.string(),
+  kind: runEventKindSchema,
+  status: taskStatusSchema.optional(),
+  stepId: z.string().optional(),
+  message: z.string(),
+  createdAt: z.string()
+});
+export type RunEvent = z.infer<typeof runEventSchema>;
+
+export const messageBindingSchema = z.object({
+  id: z.string(),
+  channel: z.enum(["telegram"]),
+  runId: z.string(),
+  chatId: z.string(),
+  messageId: z.string(),
+  mode: z.enum(["status_card"]),
+  createdAt: z.string(),
+  updatedAt: z.string()
+});
+export type MessageBinding = z.infer<typeof messageBindingSchema>;
 
 export const modelProfileSchema = z.object({
   role: z.enum(["planner", "vision", "executor", "critic"]),

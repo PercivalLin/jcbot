@@ -2,6 +2,22 @@ import Foundation
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import ImageIO
+import Vision
+
+private func accessibilityObserverCallback(
+    _ observer: AXObserver,
+    _ element: AXUIElement,
+    _ notification: CFString,
+    _ refcon: UnsafeMutableRawPointer?
+) {
+    guard let refcon else {
+        return
+    }
+
+    let service = Unmanaged<BridgeService>.fromOpaque(refcon).takeUnretainedValue()
+    service.recordAccessibilityEvent(notification: notification as String, element: element)
+}
 
 final class BridgeService {
     private static let defaultKnownApplications = [
@@ -24,8 +40,47 @@ final class BridgeService {
         "Weixin": "WeChat",
         "weixin": "WeChat"
     ]
+    private static let accessibilityNotifications = [
+        kAXFocusedUIElementChangedNotification as String,
+        kAXFocusedWindowChangedNotification as String,
+        kAXMainWindowChangedNotification as String,
+        kAXWindowCreatedNotification as String,
+        kAXTitleChangedNotification as String,
+        kAXValueChangedNotification as String,
+        kAXSelectedChildrenChangedNotification as String
+    ]
 
     private var knownApplications = BridgeService.defaultKnownApplications
+    private var observedProcessIdentifier: pid_t?
+    private var accessibilityObserver: AXObserver?
+    private var recentAccessibilityEvents: [SnapshotEvent] = []
+    private let maxRecentAccessibilityEvents = 18
+    private var workspaceObserver: NSObjectProtocol?
+
+    init() {
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            guard let self else {
+                return
+            }
+
+            let appName =
+                (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.localizedName ??
+                NSWorkspace.shared.frontmostApplication?.localizedName ??
+                "Unknown"
+            self.recordSystemEvent(kind: "application.activated", message: "Activated \(appName)")
+        }
+    }
+
+    deinit {
+        if let workspaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
+        }
+        detachAccessibilityObserver()
+    }
 
     func handle(line: String) -> String {
         do {
@@ -47,16 +102,15 @@ final class BridgeService {
                     let matches = searchApplications(query: query)
                     return encode(id: request.id, result: matches)
                 case "policy.validateAction":
-                    let actionKind = request.params?["actionKind"] ?? ""
-                    let approvalToken = request.params?["approvalToken"]
-                    let result = BridgePolicy.validate(actionKind: actionKind, approvalToken: approvalToken)
+                    let action = ActionRequest(params: request.params)
+                    let result = BridgePolicy.validate(action: action)
                     return encode(id: request.id, result: result)
                 case "observation.snapshot":
                     let snapshot = buildSnapshot()
                     return encode(id: request.id, result: snapshot)
                 case "ui.performAction":
                     let action = ActionRequest(params: request.params)
-                    let validation = BridgePolicy.validate(actionKind: action.actionKind, approvalToken: action.approvalToken)
+                    let validation = BridgePolicy.validate(action: action)
                     if validation.allowed == false {
                         return encode(id: request.id, error: JsonRpcError(code: -32010, message: validation.reason))
                     }
@@ -88,31 +142,59 @@ final class BridgeService {
     }
 
     private func currentCapabilities() -> BridgeCapabilities {
-        BridgeCapabilities(
-            accessibility: AXIsProcessTrusted(),
-            screenCapture: CGPreflightScreenCaptureAccess(),
+        let accessibility = AXIsProcessTrusted()
+        let screenCapture = CGPreflightScreenCaptureAccess()
+
+        return BridgeCapabilities(
+            accessibility: accessibility,
+            screenCapture: screenCapture,
             eventTap: true,
-            ocr: false,
-            policyHardGate: true
+            ocr: screenCapture,
+            policyHardGate: true,
+            protocolVersion: 2,
+            supportedActions: supportedActions(),
+            observationModes: supportedObservationModes(accessibility: accessibility, screenCapture: screenCapture)
         )
     }
 
     private func buildSnapshot() -> SnapshotResult {
+        refreshAccessibilityObserver()
+        pumpAccessibilityObserverRunLoop()
+        let formatter = ISO8601DateFormatter()
+        let capturedAt = Date()
+        let snapshotAt = formatter.string(from: capturedAt)
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? "Unknown"
         let windows = visibleWindows()
-        let candidates = accessibilityCandidates()
+        let accessibility = accessibilityCandidates()
+        let focusedElement = focusedAccessibilityCandidate()
         let activeWindowTitle = windows.first(where: { $0.ownerName == activeApp && !$0.title.isEmpty })?.title
-        let note = "Observed \(windows.count) on-screen windows and \(candidates.count) accessibility candidates."
+        let screenshot = captureScreenshot(timestamp: capturedAt)
+        let ocrObservation = screenshot.flatMap { recognizeText(in: $0.path) } ?? OCRObservation.empty
+        let candidates = mergedCandidates(
+            accessibilityCandidates: accessibility.map(\.candidate),
+            ocrCandidates: ocrObservation.candidates
+        )
+        let note = "Observed \(windows.count) on-screen windows, \(accessibility.count) accessibility candidates, and \(ocrObservation.texts.count) OCR text matches."
+        let observationMode = snapshotObservationMode(
+            accessibilityTrusted: AXIsProcessTrusted(),
+            screenshotPath: screenshot?.path
+        )
 
         return SnapshotResult(
-            screenshotRef: "bridge://snapshot/\(ISO8601DateFormatter().string(from: Date()))",
+            screenshotRef: screenshot?.ref ?? "bridge://snapshot/\(snapshotAt)",
             activeApp: activeApp,
             activeWindowTitle: activeWindowTitle,
             note: note,
+            ocrText: ocrObservation.texts,
             windows: windows.map { descriptor in
                 descriptor.title.isEmpty ? descriptor.ownerName : "\(descriptor.ownerName): \(descriptor.title)"
             },
-            candidates: candidates.map(\.candidate)
+            snapshotAt: snapshotAt,
+            screenshotPath: screenshot?.path,
+            observationMode: observationMode,
+            focusedElement: focusedElement,
+            recentEvents: currentObservationEvents(),
+            candidates: candidates
         )
     }
 
@@ -140,6 +222,108 @@ final class BridgeService {
         }
         .prefix(limit)
         .map { $0 }
+    }
+
+    private func refreshAccessibilityObserver() {
+        guard AXIsProcessTrusted(),
+              let app = NSWorkspace.shared.frontmostApplication else {
+            detachAccessibilityObserver()
+            return
+        }
+
+        if observedProcessIdentifier == app.processIdentifier, accessibilityObserver != nil {
+            return
+        }
+
+        detachAccessibilityObserver()
+
+        var observer: AXObserver?
+        let result = AXObserverCreate(app.processIdentifier, accessibilityObserverCallback, &observer)
+        guard result == .success, let observer else {
+            return
+        }
+
+        let applicationElement = AXUIElementCreateApplication(app.processIdentifier)
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        for notification in BridgeService.accessibilityNotifications {
+            _ = AXObserverAddNotification(observer, applicationElement, notification as CFString, refcon)
+        }
+
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        accessibilityObserver = observer
+        observedProcessIdentifier = app.processIdentifier
+    }
+
+    private func detachAccessibilityObserver() {
+        guard let observer = accessibilityObserver else {
+            observedProcessIdentifier = nil
+            return
+        }
+
+        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        accessibilityObserver = nil
+        observedProcessIdentifier = nil
+    }
+
+    private func pumpAccessibilityObserverRunLoop() {
+        _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+    }
+
+    private func currentObservationEvents(limit: Int = 8) -> [SnapshotEvent] {
+        Array(recentAccessibilityEvents.suffix(limit))
+    }
+
+    fileprivate func recordAccessibilityEvent(notification: String, element: AXUIElement) {
+        let formatter = ISO8601DateFormatter()
+        let role = copyStringValue(from: element, attribute: kAXRoleAttribute as CFString) ?? "AXUnknown"
+        let label = resolvedAccessibilityLabel(for: element) ?? role
+        let message = "\(notification) -> \(label)"
+        recentAccessibilityEvents.append(
+            SnapshotEvent(
+                id: UUID().uuidString,
+                kind: normalizeAccessibilityNotification(notification),
+                message: message,
+                createdAt: formatter.string(from: Date())
+            )
+        )
+
+        if recentAccessibilityEvents.count > maxRecentAccessibilityEvents {
+            recentAccessibilityEvents.removeFirst(recentAccessibilityEvents.count - maxRecentAccessibilityEvents)
+        }
+    }
+
+    private func recordSystemEvent(kind: String, message: String) {
+        recentAccessibilityEvents.append(
+            SnapshotEvent(
+                id: UUID().uuidString,
+                kind: kind,
+                message: message,
+                createdAt: ISO8601DateFormatter().string(from: Date())
+            )
+        )
+
+        if recentAccessibilityEvents.count > maxRecentAccessibilityEvents {
+            recentAccessibilityEvents.removeFirst(recentAccessibilityEvents.count - maxRecentAccessibilityEvents)
+        }
+    }
+
+    private func normalizeAccessibilityNotification(_ notification: String) -> String {
+        switch notification {
+        case kAXFocusedUIElementChangedNotification as String:
+            return "focus.changed"
+        case kAXFocusedWindowChangedNotification as String, kAXMainWindowChangedNotification as String:
+            return "window.changed"
+        case kAXWindowCreatedNotification as String:
+            return "window.created"
+        case kAXTitleChangedNotification as String:
+            return "title.changed"
+        case kAXValueChangedNotification as String:
+            return "value.changed"
+        case kAXSelectedChildrenChangedNotification as String:
+            return "selection.changed"
+        default:
+            return notification
+        }
     }
 
     private func performAction(_ action: ActionRequest) throws -> PerformActionResult {
@@ -1151,6 +1335,21 @@ final class BridgeService {
         return results
     }
 
+    private func focusedAccessibilityCandidate() -> SnapshotCandidate? {
+        guard AXIsProcessTrusted(),
+              let app = NSWorkspace.shared.frontmostApplication else {
+            return nil
+        }
+
+        let applicationElement = AXUIElementCreateApplication(app.processIdentifier)
+        guard let focused = copyAttributeValue(from: applicationElement, attribute: kAXFocusedUIElementAttribute as CFString),
+              CFGetTypeID(focused) == AXUIElementGetTypeID() else {
+            return nil
+        }
+
+        return snapshotCandidate(for: focused as! AXUIElement, fallbackId: 9_999)
+    }
+
     private func collectAccessibilityCandidates(
         from element: AXUIElement,
         depth: Int,
@@ -1278,6 +1477,184 @@ final class BridgeService {
             width: size.width,
             height: size.height
         )
+    }
+
+    private func captureScreenshot(timestamp: Date) -> (path: String, ref: String)? {
+        guard CGPreflightScreenCaptureAccess(),
+              let image = CGDisplayCreateImage(CGMainDisplayID()) else {
+            return nil
+        }
+
+        let snapshotDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("lobster-bridge-snapshots", isDirectory: true)
+        try? FileManager.default.createDirectory(at: snapshotDirectory, withIntermediateDirectories: true, attributes: nil)
+
+        let identifier = ISO8601DateFormatter().string(from: timestamp).replacingOccurrences(of: ":", with: "-")
+        let fileURL = snapshotDirectory.appendingPathComponent("snapshot-\(identifier).png")
+        let bitmap = NSBitmapImageRep(cgImage: image)
+
+        guard let pngData = bitmap.representation(using: .png, properties: [:]) else {
+            return nil
+        }
+
+        do {
+            try pngData.write(to: fileURL, options: [.atomic])
+            return (path: fileURL.path, ref: "bridge://snapshot/\(identifier)")
+        } catch {
+            return nil
+        }
+    }
+
+    func recognizeText(in imagePath: String, limit: Int = 24) -> OCRObservation? {
+        let fileURL = URL(fileURLWithPath: imagePath)
+        guard let source = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            return nil
+        }
+
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.minimumTextHeight = 0.015
+        request.recognitionLanguages = ["en-US", "zh-Hans"]
+
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            return nil
+        }
+
+        guard let observations = request.results, observations.isEmpty == false else {
+            return OCRObservation.empty
+        }
+
+        let imageWidth = Double(image.width)
+        let imageHeight = Double(image.height)
+        var texts: [String] = []
+        var candidates: [SnapshotCandidate] = []
+        var seen = Set<String>()
+
+        for (index, observation) in observations.prefix(limit).enumerated() {
+            guard let topCandidate = observation.topCandidates(1).first else {
+                continue
+            }
+
+            let recognized = topCandidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard recognized.isEmpty == false else {
+                continue
+            }
+
+            let dedupeKey = normalizeOCRLabel(recognized)
+            if seen.contains(dedupeKey) {
+                continue
+            }
+            seen.insert(dedupeKey)
+
+            let bounds = ocrBounds(from: observation.boundingBox, imageWidth: imageWidth, imageHeight: imageHeight)
+            texts.append(recognized)
+            candidates.append(
+                SnapshotCandidate(
+                    id: "ocr-\(index)",
+                    role: "text",
+                    label: recognized,
+                    value: recognized,
+                    focused: nil,
+                    bounds: bounds,
+                    confidence: Double(topCandidate.confidence),
+                    source: "ocr"
+                )
+            )
+        }
+
+        return OCRObservation(texts: texts, candidates: candidates)
+    }
+
+    private func mergedCandidates(
+        accessibilityCandidates: [SnapshotCandidate],
+        ocrCandidates: [SnapshotCandidate],
+        limit: Int = 40
+    ) -> [SnapshotCandidate] {
+        var merged = accessibilityCandidates
+        let existingLabels = Set(accessibilityCandidates.map { normalizeOCRLabel($0.label) })
+
+        for candidate in ocrCandidates {
+            if merged.count >= limit {
+                break
+            }
+
+            let normalizedLabel = normalizeOCRLabel(candidate.label)
+            guard existingLabels.contains(normalizedLabel) == false else {
+                continue
+            }
+
+            merged.append(candidate)
+        }
+
+        return merged
+    }
+
+    private func ocrBounds(from boundingBox: CGRect, imageWidth: Double, imageHeight: Double) -> SnapshotBounds {
+        SnapshotBounds(
+            x: boundingBox.minX * imageWidth,
+            y: (1 - boundingBox.maxY) * imageHeight,
+            width: boundingBox.width * imageWidth,
+            height: boundingBox.height * imageHeight
+        )
+    }
+
+    private func normalizeOCRLabel(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+    }
+
+    private func supportedActions() -> [String] {
+        [
+            "ui.open_app",
+            "ui.activate_app",
+            "ui.focus_target",
+            "ui.type_into_target",
+            "external.select_contact",
+            "external.upload_file",
+            "ui.type_text",
+            "ui.paste_text",
+            "ui.click",
+            "ui.double_click",
+            "ui.click_target",
+            "ui.scroll",
+            "ui.hotkey",
+            "ui.navigate",
+            "ui.inspect",
+            "ui.read"
+        ]
+    }
+
+    private func supportedObservationModes(accessibility: Bool, screenCapture: Bool) -> [String] {
+        var modes: [String] = []
+        if accessibility {
+            modes.append("accessibility")
+        }
+        if screenCapture {
+            modes.append(accessibility ? "hybrid" : "visual")
+        }
+        if modes.isEmpty {
+            modes.append("stub")
+        }
+        return modes
+    }
+
+    private func snapshotObservationMode(accessibilityTrusted: Bool, screenshotPath: String?) -> String {
+        if accessibilityTrusted && screenshotPath != nil {
+            return "hybrid"
+        }
+        if accessibilityTrusted {
+            return "accessibility"
+        }
+        if screenshotPath != nil {
+            return "visual"
+        }
+        return "stub"
     }
 
     private func copyAttributeValue(from element: AXUIElement, attribute: CFString) -> CFTypeRef? {
@@ -1451,6 +1828,13 @@ private struct EmptyRpcResult: Codable {}
 private struct ResolvedAccessibilityElement {
     let element: AXUIElement
     let candidate: SnapshotCandidate
+}
+
+struct OCRObservation {
+    let texts: [String]
+    let candidates: [SnapshotCandidate]
+
+    static let empty = OCRObservation(texts: [], candidates: [])
 }
 
 private struct HotkeyChord {

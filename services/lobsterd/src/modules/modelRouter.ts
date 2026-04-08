@@ -1,4 +1,6 @@
-import { generateText, type LanguageModel } from "ai";
+import { readFile } from "node:fs/promises";
+import { extname } from "node:path";
+import { generateText, type CoreMessage, type LanguageModel } from "ai";
 import { anthropic } from "@ai-sdk/anthropic";
 import { google } from "@ai-sdk/google";
 import { createOpenAI } from "@ai-sdk/openai";
@@ -6,7 +8,7 @@ import type { ModelProfile } from "@lobster/shared";
 import { promptOpenAICompatibleViaCurl } from "./openaiCompatibleCurl.js";
 
 export class ModelRouter {
-  constructor(private readonly profiles: Record<ModelProfile["role"], ModelProfile>) {}
+  constructor(private profiles: Record<ModelProfile["role"], ModelProfile>) {}
 
   listProfiles() {
     return this.profiles;
@@ -16,9 +18,14 @@ export class ModelRouter {
     return this.profiles[role];
   }
 
+  replaceProfiles(profiles: Record<ModelProfile["role"], ModelProfile>) {
+    this.profiles = profiles;
+  }
+
   async prompt(role: ModelProfile["role"], prompt: string): Promise<string> {
     const profile = this.resolveProfile(role);
     const apiKey = this.resolveApiKey(profile);
+    const deadlineAt = Date.now() + profile.timeoutMs;
 
     if (!this.hasProviderCredential(profile)) {
       this.trace(
@@ -28,27 +35,41 @@ export class ModelRouter {
     }
 
     try {
-      const model = this.buildModel(profile);
-      const response = await generateText({
-        model,
-        prompt,
-        maxTokens: profile.budget.outputTokens
+      const responseText = await this.runWithDeadline({
+        deadlineAt,
+        role,
+        task: async (signal) => {
+          const model = this.buildModel(profile);
+          const response = await generateText({
+            model,
+            prompt,
+            maxTokens: profile.budget.outputTokens,
+            abortSignal: signal
+          } as Parameters<typeof generateText>[0]);
+          return response.text;
+        },
+        timeoutMs: profile.timeoutMs
       });
 
       this.trace(
         `[model][${role}] provider=${profile.provider} model=${profile.modelId} result=ok path=sdk`
       );
-      return response.text;
+      return responseText;
     } catch (error) {
       this.trace(
         `[model][${role}] provider=${profile.provider} model=${profile.modelId} result=error path=sdk error="${summarizeError(error)}"`
       );
       if (profile.provider === "openai-compatible") {
         try {
+          const remainingTimeoutMs = this.remainingTimeoutMs(deadlineAt);
+          if (remainingTimeoutMs <= 0) {
+            throw new Error(`Model call budget exhausted before curl fallback (${profile.timeoutMs}ms).`);
+          }
           const recovered = await promptOpenAICompatibleViaCurl({
             apiKey,
             profile,
-            prompt
+            prompt,
+            timeoutMs: remainingTimeoutMs
           });
           this.trace(
             `[model][${role}] provider=${profile.provider} model=${profile.modelId} result=ok path=curl-fallback`
@@ -65,6 +86,75 @@ export class ModelRouter {
         `[model][${role}] provider=${profile.provider} model=${profile.modelId} result=stub reason=all_paths_failed`
       );
       return `[stub:${role}] ${prompt}`;
+    }
+  }
+
+  async promptWithImage(
+    role: ModelProfile["role"],
+    input: {
+      imagePath: string;
+      mimeType?: string;
+      system?: string;
+      text: string;
+    }
+  ): Promise<string> {
+    const profile = this.resolveProfile(role);
+    const deadlineAt = Date.now() + profile.timeoutMs;
+
+    if (!this.hasProviderCredential(profile)) {
+      this.trace(
+        `[model][${role}] provider=${profile.provider} model=${profile.modelId} result=stub reason=missing_credential modality=image`
+      );
+      return `[stub:${role}] ${input.text}`;
+    }
+
+    try {
+      const responseText = await this.runWithDeadline({
+        deadlineAt,
+        role,
+        task: async (signal) => {
+          const model = this.buildModel(profile);
+          const image = await readFile(input.imagePath);
+          const messages: CoreMessage[] = [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: input.text
+                },
+                {
+                  type: "image",
+                  image,
+                  mimeType: input.mimeType ?? guessImageMimeType(input.imagePath)
+                }
+              ]
+            }
+          ];
+          const response = await generateText({
+            model,
+            system: input.system,
+            messages,
+            maxTokens: profile.budget.outputTokens,
+            abortSignal: signal
+          } as Parameters<typeof generateText>[0]);
+          return response.text;
+        },
+        timeoutMs: profile.timeoutMs
+      });
+
+      this.trace(
+        `[model][${role}] provider=${profile.provider} model=${profile.modelId} result=ok path=sdk modality=image`
+      );
+      return responseText;
+    } catch (error) {
+      this.trace(
+        `[model][${role}] provider=${profile.provider} model=${profile.modelId} result=error path=sdk-image error="${summarizeError(error)}"`
+      );
+      this.trace(
+        `[model][${role}] provider=${profile.provider} model=${profile.modelId} result=stub reason=all_paths_failed modality=image`
+      );
+      return `[stub:${role}] ${input.text}`;
     }
   }
 
@@ -127,6 +217,56 @@ export class ModelRouter {
     }
 
     return Boolean(this.resolveApiKey(profile));
+  }
+
+  private async runWithDeadline<T>(options: {
+    deadlineAt: number;
+    role: ModelProfile["role"];
+    task: (signal: AbortSignal) => Promise<T>;
+    timeoutMs: number;
+  }) {
+    const remainingTimeoutMs = this.remainingTimeoutMs(options.deadlineAt);
+    if (remainingTimeoutMs <= 0) {
+      throw new Error(
+        `Model ${options.role} timed out before execution started (budget=${options.timeoutMs}ms).`
+      );
+    }
+
+    const controller = new AbortController();
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        controller.abort();
+        reject(new Error(`Model ${options.role} timed out after ${remainingTimeoutMs}ms.`));
+      }, remainingTimeoutMs);
+      timeoutHandle.unref?.();
+    });
+
+    try {
+      return await Promise.race([options.task(controller.signal), timeoutPromise]);
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
+  }
+
+  private remainingTimeoutMs(deadlineAt: number) {
+    return Math.max(0, deadlineAt - Date.now());
+  }
+}
+
+function guessImageMimeType(path: string) {
+  switch (extname(path).toLowerCase()) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".webp":
+      return "image/webp";
+    case ".gif":
+      return "image/gif";
+    default:
+      return "image/png";
   }
 }
 

@@ -11,6 +11,19 @@ type CurlResponse = {
 type TelegramSendResponse = {
   ok: boolean;
   description?: string;
+  result?: {
+    message_id?: number;
+  };
+};
+
+type TelegramEditResponse = TelegramSendResponse;
+type TelegramCallbackResponse = {
+  ok: boolean;
+  description?: string;
+};
+
+export type TelegramInlineKeyboardMarkup = {
+  inline_keyboard: Array<Array<{ callback_data: string; text: string }>>;
 };
 
 export function resolveTelegramProxyUrl() {
@@ -44,7 +57,7 @@ export async function postTelegramJson<T>(
     return parseJsonResponse<T>(response.status, response.bodyText);
   }
 
-  return postViaFetch<T>(url, payloadText);
+  return postViaFetch<T>(url, payloadText, timeoutMs);
 }
 
 export async function sendTelegramTextMessage(options: {
@@ -52,14 +65,16 @@ export async function sendTelegramTextMessage(options: {
   botToken: string;
   chatId: string;
   text: string;
+  replyMarkup?: TelegramInlineKeyboardMarkup;
 }) {
-  const { baseUrl, botToken, chatId, text } = options;
+  const { baseUrl, botToken, chatId, text, replyMarkup } = options;
   const safeText = text.length > 3500 ? `${text.slice(0, 3500)}…` : text;
   const response = await postTelegramJson<TelegramSendResponse>(
     `${baseUrl.replace(/\/$/, "")}/bot${botToken}/sendMessage`,
     {
       chat_id: chatId,
-      text: safeText
+      text: safeText,
+      reply_markup: replyMarkup
     },
     {
       timeoutMs: 15000
@@ -72,18 +87,90 @@ export async function sendTelegramTextMessage(options: {
   if (!response.payload.ok) {
     throw new Error(`Telegram sendMessage failed: ${response.payload.description ?? "unknown error"}`);
   }
+
+  return {
+    messageId: String(response.payload.result?.message_id ?? "")
+  };
 }
 
-async function postViaFetch<T>(url: string, payloadText: string) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json; charset=utf-8"
+export async function editTelegramTextMessage(options: {
+  baseUrl: string;
+  botToken: string;
+  chatId: string;
+  messageId: string;
+  text: string;
+  replyMarkup?: TelegramInlineKeyboardMarkup;
+}) {
+  const { baseUrl, botToken, chatId, messageId, text, replyMarkup } = options;
+  const safeText = text.length > 3500 ? `${text.slice(0, 3500)}…` : text;
+  const response = await postTelegramJson<TelegramEditResponse>(
+    `${baseUrl.replace(/\/$/, "")}/bot${botToken}/editMessageText`,
+    {
+      chat_id: chatId,
+      message_id: Number.parseInt(messageId, 10),
+      text: safeText,
+      reply_markup: replyMarkup
     },
-    body: payloadText
-  });
-  const bodyText = await response.text();
-  return parseJsonResponse<T>(response.status, bodyText);
+    {
+      timeoutMs: 15000
+    }
+  );
+
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`Telegram editMessageText failed with HTTP ${response.status}.`);
+  }
+  if (!response.payload.ok) {
+    throw new Error(`Telegram editMessageText failed: ${response.payload.description ?? "unknown error"}`);
+  }
+}
+
+export async function answerTelegramCallbackQuery(options: {
+  baseUrl: string;
+  botToken: string;
+  callbackQueryId: string;
+  text?: string;
+}) {
+  const response = await postTelegramJson<TelegramCallbackResponse>(
+    `${options.baseUrl.replace(/\/$/, "")}/bot${options.botToken}/answerCallbackQuery`,
+    {
+      callback_query_id: options.callbackQueryId,
+      text: options.text
+    },
+    {
+      timeoutMs: 10000
+    }
+  );
+
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`Telegram answerCallbackQuery failed with HTTP ${response.status}.`);
+  }
+  if (!response.payload.ok) {
+    throw new Error(`Telegram answerCallbackQuery failed: ${response.payload.description ?? "unknown error"}`);
+  }
+}
+
+async function postViaFetch<T>(url: string, payloadText: string, timeoutMs: number) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json; charset=utf-8"
+      },
+      body: payloadText,
+      signal: controller.signal
+    });
+    const bodyText = await response.text();
+    return parseJsonResponse<T>(response.status, bodyText);
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`telegram fetch request timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function parseJsonResponse<T>(status: number, bodyText: string) {

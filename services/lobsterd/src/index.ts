@@ -1,13 +1,15 @@
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadModelProfiles } from "./modules/config.js";
+import type { TaskRun } from "@lobster/shared";
+import { loadModelProfilesOrDefault } from "./modules/config.js";
 import { createBridgeClient } from "./modules/bridgeClient.js";
 import { resolveWorkspaceConfigFile } from "./modules/paths.js";
 import { ModelRouter } from "./modules/modelRouter.js";
 import { loadRuntimeEnvFile } from "./modules/runtimeEnv.js";
 import { resolveTelegramRuntimeConfig } from "./modules/telegramConfig.js";
 import { startTelegramPollingIngress, type TelegramIngressCommand } from "./modules/telegramIngress.js";
-import { sendTelegramTextMessage } from "./modules/telegramHttp.js";
+import { answerTelegramCallbackQuery, sendTelegramTextMessage } from "./modules/telegramHttp.js";
 import { normalizeTelegramChatReply } from "./modules/chatReply.js";
 import { createTelegramRuntimeNotifierFromEnv } from "./modules/telegramNotifier.js";
 import { acquireInstanceLock } from "./modules/instanceLock.js";
@@ -16,6 +18,9 @@ import {
   loadChatPluginRegistry
 } from "./modules/chatPluginRegistry.js";
 import { buildRuntimeReadinessReport } from "./modules/runtimeReadiness.js";
+import { readAdminConfigSnapshot } from "./modules/adminConfig.js";
+import { AdminServer } from "./modules/adminServer.js";
+import { RuntimeEventBus } from "./modules/runtimeEventBus.js";
 import { RpcServer } from "./ipc/rpcServer.js";
 import { getKnownApplications } from "@lobster/skills";
 import { createRuntimePersistence } from "@lobster/storage";
@@ -65,35 +70,40 @@ export async function startLobsterd() {
     });
     const SOCKET_PATH = process.env.LOBSTER_SOCKET_PATH ?? "/tmp/lobster/lobsterd.sock";
     const DATA_PATH = process.env.LOBSTER_DATA_PATH ?? "/tmp/lobster/lobster.sqlite";
+    const ADMIN_PORT = readAdminConfigSnapshot().runtime.adminPort;
     const CHAT_PLUGINS_PATH =
       resolveWorkspaceConfigFile({
         importMetaUrl: import.meta.url,
         name: "chat_plugins.yaml",
         override: process.env.LOBSTER_CHAT_PLUGINS_PATH
       });
-    const telegramConfig = resolveTelegramRuntimeConfig();
-    const profiles = loadModelProfiles(MODELS_PATH);
-    const router = new ModelRouter(profiles);
+    let telegramConfig = resolveTelegramRuntimeConfig();
+    let currentBridgeBin = process.env.LOBSTER_BRIDGE_BIN?.trim() || "";
+    const router = new ModelRouter(loadModelProfilesOrDefault(MODELS_PATH));
     const persistence = await createRuntimePersistence({ path: DATA_PATH });
     const bridgeClient = createBridgeClient();
+    const runtimeEventBus = new RuntimeEventBus();
     const chatPluginInstances = loadChatPluginRegistry(CHAT_PLUGINS_PATH);
     const chatPluginApplications = getEnabledChatPluginApplications(chatPluginInstances);
     const notificationWhitelist =
       parseNotificationWhitelistFromEnv() ??
       Array.from(new Set([...chatPluginApplications, "Mail", "Calendar"]));
-    const knownApplications = getKnownApplications({
-      extraApplications: [
-        ...parseKnownApplicationsFromEnv(),
-        ...chatPluginApplications
-      ]
-    });
-    try {
-      await bridgeClient.configureKnownApplications(knownApplications);
-    } catch (error) {
-      console.warn(
-        `Failed to configure known application catalog on bridge: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
+    const configureKnownApplications = async () => {
+      const knownApplications = getKnownApplications({
+        extraApplications: [
+          ...parseKnownApplicationsFromEnv(),
+          ...chatPluginApplications
+        ]
+      });
+      try {
+        await bridgeClient.configureKnownApplications(knownApplications);
+      } catch (error) {
+        console.warn(
+          `Failed to configure known application catalog on bridge: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    };
+    await configureKnownApplications();
 
     const runtimeReadinessProvider = async () => {
       let bridgeCapabilities;
@@ -109,19 +119,23 @@ export async function startLobsterd() {
         chatPlugins: chatPluginInstances,
         dataPath: DATA_PATH,
         telegram: telegramConfig,
-        profiles,
+        profiles: router.listProfiles(),
         socketPath: SOCKET_PATH
       });
     };
 
-    const notifier = createTelegramRuntimeNotifierFromEnv(telegramConfig);
+    const notifier = createTelegramRuntimeNotifierFromEnv(() => telegramConfig, persistence);
     const rpcServer = new RpcServer(SOCKET_PATH, router, persistence, bridgeClient, notifier, {
       chatPlugins: chatPluginInstances,
+      eventBus: runtimeEventBus,
       notificationWhitelist,
       runtimeReadinessProvider
     });
     const rpcSocketServer = await rpcServer.start();
+    let adminServer: AdminServer | undefined;
+    let closeTelegramIngress: (() => Promise<void>) | undefined;
     console.log(`lobsterd listening on ${SOCKET_PATH} with ${persistence.backend} persistence`);
+    console.log(`admin console listening on http://127.0.0.1:${ADMIN_PORT}`);
     console.log(`instance lock acquired on ${instanceLock.lockPath} (pid=${instanceLock.pid})`);
 
     const readiness = await runtimeReadinessProvider();
@@ -129,16 +143,22 @@ export async function startLobsterd() {
       `runtime readiness: ok=${readiness.summary.ok}, warn=${readiness.summary.warn}, fail=${readiness.summary.fail}`
     );
 
+    const publishReadiness = async () => {
+      if (!adminServer) {
+        return;
+      }
+      adminServer.publish({
+        event: "readiness.updated",
+        data: await runtimeReadinessProvider()
+      });
+    };
+
     const handleTelegramCommand = async (command: TelegramIngressCommand) => {
       switch (command.kind) {
         case "task.create": {
           traceChat(
             `[ingress][telegram][task] user=${maskIdentifier(command.request.userId)} text="${preview(command.request.text)}"`
           );
-          await maybeSendTelegramTaskAck({
-            chatId: command.request.userId,
-            telegramConfig
-          });
           const created = await rpcServer.createTask(command.request);
           traceChat(
             `[egress][runtime][task] run=${created.run.runId} status=${created.run.status}` +
@@ -153,10 +173,6 @@ export async function startLobsterd() {
           traceChat(
             `[ingress][telegram][chat] chat=${maskIdentifier(command.chatId)} text="${preview(command.text)}"`
           );
-          await maybeSendTelegramTaskAck({
-            chatId: command.chatId,
-            telegramConfig
-          });
           const rawReply = await router.prompt("planner", buildTelegramChatPrompt(command.text));
           const reply = normalizeTelegramChatReply(rawReply);
           traceChat(
@@ -172,19 +188,54 @@ export async function startLobsterd() {
           });
           return undefined;
         }
-        case "approval.approve":
+        case "approval.approve": {
           traceChat(
             `[ingress][telegram][approve] by=${maskIdentifier(command.approvedBy)} ticket=${command.ticketId}`
           );
+          if (command.callbackQueryId && telegramConfig.botToken) {
+            await safeAnswerCallbackQuery(telegramConfig, command.callbackQueryId, "正在继续执行");
+          }
           return rpcServer.approveTicket(command.ticketId, command.approvedBy);
+        }
         case "approval.deny":
           traceChat(`[ingress][telegram][deny] ticket=${command.ticketId}`);
+          if (command.callbackQueryId && telegramConfig.botToken) {
+            await safeAnswerCallbackQuery(telegramConfig, command.callbackQueryId, "已拒绝该操作");
+          }
           return rpcServer.denyTicket(command.ticketId);
+        case "run.status": {
+          if (!telegramConfig.botToken) {
+            return undefined;
+          }
+          const run = command.runId
+            ? await rpcServer.getRun(command.runId)
+            : (await rpcServer.listRuns()).find(
+                (candidate) =>
+                  candidate.request.source === "telegram" && candidate.request.userId === command.chatId
+              );
+          const events = run ? await rpcServer.listRunEvents(run.runId) : [];
+          await sendTelegramTextMessage({
+            baseUrl: telegramConfig.baseUrl,
+            botToken: telegramConfig.botToken,
+            chatId: command.chatId,
+            text: formatRunStatusMessage(run, events)
+          });
+          return run;
+        }
       }
     };
 
-    let closeTelegramIngress: (() => Promise<void>) | undefined;
-    if (telegramConfig.botToken) {
+    const restartTelegramIngress = async () => {
+      if (closeTelegramIngress) {
+        await closeTelegramIngress();
+        closeTelegramIngress = undefined;
+      }
+
+      if (!telegramConfig.botToken) {
+        console.log("telegram ingress disabled (missing LOBSTER_TELEGRAM_BOT_TOKEN).");
+        return;
+      }
+
       try {
         const ingress = await startTelegramPollingIngress({
           config: telegramConfig,
@@ -203,12 +254,56 @@ export async function startLobsterd() {
         console.warn("Fallback mode: local standalone chat only.");
         console.log("chat ingress mode: local standalone (desktop + local CLI)");
       }
-    } else {
-      console.log("chat ingress mode: local standalone (desktop + local CLI)");
-    }
-    if (!telegramConfig.botToken) {
-      console.log("telegram ingress disabled (missing LOBSTER_TELEGRAM_BOT_TOKEN).");
-    }
+    };
+
+    runtimeEventBus.subscribe((event) => {
+      adminServer?.publish({
+        event: "run.event",
+        data: event
+      });
+      if (event.event.kind === "approval.requested" || event.event.kind === "approval.resolved") {
+        adminServer?.publish({
+          event: "approval.updated",
+          data: event
+        });
+      }
+    });
+
+    adminServer = new AdminServer(ADMIN_PORT, {
+      bridgeCapabilitiesProvider: async () => {
+        try {
+          return await bridgeClient.describeCapabilities();
+        } catch {
+          return undefined;
+        }
+      },
+      csrfToken: randomUUID(),
+      onModelsUpdated: async (profiles) => {
+        router.replaceProfiles(profiles);
+        await publishReadiness();
+      },
+      onRuntimeConfigUpdated: async (snapshot) => {
+        const bridgeBin = snapshot.runtime.bridgeBin.trim();
+        if (bridgeBin && bridgeBin !== currentBridgeBin) {
+          await bridgeClient.restart?.({
+            command: bridgeBin,
+            args: parseBridgeArgsFromEnv()
+          });
+          currentBridgeBin = bridgeBin;
+        }
+        telegramConfig = resolveTelegramRuntimeConfig();
+        await configureKnownApplications();
+        await restartTelegramIngress();
+        await publishReadiness();
+      },
+      rpcServer,
+      runtimeReadinessProvider
+    });
+    await adminServer.start();
+    await restartTelegramIngress();
+    const readinessInterval = setInterval(() => {
+      void publishReadiness();
+    }, 15_000);
 
     let shuttingDown = false;
     const shutdown = async () => {
@@ -217,11 +312,15 @@ export async function startLobsterd() {
       }
       shuttingDown = true;
       try {
+        clearInterval(readinessInterval);
         await new Promise<void>((resolve, reject) => {
           rpcSocketServer.close((error) => (error ? reject(error) : resolve()));
         });
         if (closeTelegramIngress) {
           await closeTelegramIngress();
+        }
+        if (adminServer) {
+          await adminServer.close();
         }
       } finally {
         releaseInstanceLock();
@@ -275,41 +374,53 @@ function isStubReply(text: string) {
   return /^\[stub:[^\]]+\]/.test(text.trim());
 }
 
-async function maybeSendTelegramTaskAck(params: {
-  chatId: string;
-  telegramConfig: ReturnType<typeof resolveTelegramRuntimeConfig>;
-}) {
-  if (!isTelegramTaskAckEnabled()) {
-    return;
-  }
-  const token = params.telegramConfig.botToken?.trim();
-  if (!token) {
+function parseBridgeArgsFromEnv() {
+  return process.env.LOBSTER_BRIDGE_ARGS?.split(" ").map((value) => value.trim()).filter(Boolean) ?? [];
+}
+
+async function safeAnswerCallbackQuery(
+  telegramConfig: ReturnType<typeof resolveTelegramRuntimeConfig>,
+  callbackQueryId: string,
+  text: string
+) {
+  if (!telegramConfig.botToken) {
     return;
   }
 
   try {
-    await sendTelegramTextMessage({
-      baseUrl: params.telegramConfig.baseUrl,
-      botToken: token,
-      chatId: params.chatId,
-      text: "收到，正在处理你的指令..."
+    await answerTelegramCallbackQuery({
+      baseUrl: telegramConfig.baseUrl,
+      botToken: telegramConfig.botToken,
+      callbackQueryId,
+      text
     });
-    traceChat(`[egress][telegram][ack] chat=${maskIdentifier(params.chatId)} sent`);
   } catch (error) {
     traceChat(
-      `[egress][telegram][ack] chat=${maskIdentifier(params.chatId)} failed=${
-        error instanceof Error ? error.message : String(error)
-      }`
+      `[egress][telegram][callback] failed=${error instanceof Error ? error.message : String(error)}`
     );
   }
 }
 
-function isTelegramTaskAckEnabled() {
-  const raw = process.env.LOBSTER_TELEGRAM_TASK_ACK?.trim().toLowerCase();
-  if (!raw) {
-    return true;
+function formatRunStatusMessage(run: TaskRun | undefined, events: Array<{ createdAt: string; message: string }>) {
+  if (!run) {
+    return "当前没有找到相关任务。";
   }
-  return !["0", "false", "off", "no"].includes(raw);
+
+  const step = run.currentStepId ? run.plan.find((entry) => entry.id === run.currentStepId) : undefined;
+  const recentEvents = events
+    .slice(-3)
+    .map((event) => `- ${event.createdAt}: ${event.message}`)
+    .join("\n");
+
+  return [
+    `Task ${run.runId.slice(0, 8)}`,
+    `Status: ${run.status}`,
+    step ? `Current step: ${step.title}` : "Current step: pending",
+    run.outcomeSummary ? `Summary: ${run.outcomeSummary}` : undefined,
+    recentEvents ? `Recent events:\n${recentEvents}` : undefined
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 const isDirectExecution =

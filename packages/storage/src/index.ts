@@ -1,13 +1,22 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
-import type { ApprovalTicket, CapabilityCandidate, InboxItem, TaskRun } from "@lobster/shared";
+import type {
+  ApprovalTicket,
+  CapabilityCandidate,
+  InboxItem,
+  MessageBinding,
+  RunEvent,
+  TaskRun
+} from "@lobster/shared";
 import {
   approvalTicketSchema,
   capabilityCandidateSchema,
   inboxItemSchema,
+  messageBindingSchema,
+  runEventSchema,
   taskRunSchema
 } from "@lobster/shared";
 import * as schema from "./schema.js";
@@ -16,6 +25,8 @@ type PersistenceSnapshot = {
   approvals: ApprovalTicket[];
   capabilityCandidates: CapabilityCandidate[];
   inboxItems: InboxItem[];
+  messageBindings: MessageBinding[];
+  runEvents: RunEvent[];
   runs: TaskRun[];
   runtimeState: Record<string, string>;
 };
@@ -23,17 +34,23 @@ type PersistenceSnapshot = {
 export type RuntimePersistence = {
   backend: "sqlite" | "json-file";
   getApproval(ticketId: string): Promise<ApprovalTicket | undefined>;
+  getMessageBinding(runId: string, channel: MessageBinding["channel"], mode: MessageBinding["mode"]): Promise<MessageBinding | undefined>;
   getRun(runId: string): Promise<TaskRun | undefined>;
   getRuntimeValue(key: string): Promise<string | undefined>;
   listApprovals(): Promise<ApprovalTicket[]>;
   listCapabilityCandidates(): Promise<CapabilityCandidate[]>;
   listInboxItems(): Promise<InboxItem[]>;
+  listMessageBindings(): Promise<MessageBinding[]>;
+  listRunEvents(runId: string): Promise<RunEvent[]>;
   listRuns(): Promise<TaskRun[]>;
   saveApproval(ticket: ApprovalTicket): Promise<void>;
   saveCapabilityCandidate(candidate: CapabilityCandidate): Promise<void>;
   saveInboxItem(item: InboxItem): Promise<void>;
+  saveMessageBinding(binding: MessageBinding): Promise<void>;
+  saveRunEvent(event: RunEvent): Promise<void>;
   saveRun(run: TaskRun): Promise<void>;
   setRuntimeValue(key: string, value: string): Promise<void>;
+  deleteMessageBinding(bindingId: string): Promise<void>;
 };
 
 type CreateRuntimePersistenceOptions = {
@@ -44,6 +61,8 @@ const EMPTY_SNAPSHOT: PersistenceSnapshot = {
   approvals: [],
   capabilityCandidates: [],
   inboxItems: [],
+  messageBindings: [],
+  runEvents: [],
   runs: [],
   runtimeState: {}
 };
@@ -70,6 +89,12 @@ class JsonFileRuntimePersistence implements RuntimePersistence {
     return this.read().runs.find((run) => run.runId === runId);
   }
 
+  async getMessageBinding(runId: string, channel: MessageBinding["channel"], mode: MessageBinding["mode"]) {
+    return this.read().messageBindings.find(
+      (binding) => binding.runId === runId && binding.channel === channel && binding.mode === mode
+    );
+  }
+
   async getRuntimeValue(key: string) {
     return this.read().runtimeState[key];
   }
@@ -88,6 +113,16 @@ class JsonFileRuntimePersistence implements RuntimePersistence {
 
   async listRuns() {
     return sortByNewest(this.read().runs);
+  }
+
+  async listRunEvents(runId: string) {
+    return this.read().runEvents
+      .filter((event) => event.runId === runId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  }
+
+  async listMessageBindings() {
+    return [...this.read().messageBindings].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
   async saveApproval(ticket: ApprovalTicket) {
@@ -114,12 +149,30 @@ class JsonFileRuntimePersistence implements RuntimePersistence {
     this.persist(snapshot);
   }
 
+  async saveRunEvent(event: RunEvent) {
+    const snapshot = this.read();
+    snapshot.runEvents = upsert(snapshot.runEvents, event, "eventId");
+    this.persist(snapshot);
+  }
+
+  async saveMessageBinding(binding: MessageBinding) {
+    const snapshot = this.read();
+    snapshot.messageBindings = upsert(snapshot.messageBindings, binding, "id");
+    this.persist(snapshot);
+  }
+
   async setRuntimeValue(key: string, value: string) {
     const snapshot = this.read();
     snapshot.runtimeState = {
       ...snapshot.runtimeState,
       [key]: value
     };
+    this.persist(snapshot);
+  }
+
+  async deleteMessageBinding(bindingId: string) {
+    const snapshot = this.read();
+    snapshot.messageBindings = snapshot.messageBindings.filter((binding) => binding.id !== bindingId);
     this.persist(snapshot);
   }
 
@@ -133,6 +186,8 @@ class JsonFileRuntimePersistence implements RuntimePersistence {
         capabilityCandidateSchema.parse(item)
       ),
       inboxItems: (parsed.inboxItems ?? []).map((item) => inboxItemSchema.parse(item)),
+      messageBindings: (parsed.messageBindings ?? []).map((item) => messageBindingSchema.parse(item)),
+      runEvents: (parsed.runEvents ?? []).map((item) => runEventSchema.parse(item)),
       runs: (parsed.runs ?? []).map((item) => taskRunSchema.parse(item)),
       runtimeState:
         parsed.runtimeState && typeof parsed.runtimeState === "object" ? sanitizeRuntimeState(parsed.runtimeState) : {}
@@ -184,6 +239,24 @@ class SqliteRuntimePersistence implements RuntimePersistence {
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS run_events (
+        event_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        event_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS message_bindings (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        binding_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `);
   }
 
@@ -199,6 +272,21 @@ class SqliteRuntimePersistence implements RuntimePersistence {
   async getRun(runId: string) {
     const [row] = await this.db.select().from(schema.taskRuns).where(eq(schema.taskRuns.runId, runId)).limit(1);
     return row ? taskRunSchema.parse(JSON.parse(row.runJson)) : undefined;
+  }
+
+  async getMessageBinding(runId: string, channel: MessageBinding["channel"], mode: MessageBinding["mode"]) {
+    const [row] = await this.db
+      .select()
+      .from(schema.messageBindings)
+      .where(
+        and(
+          eq(schema.messageBindings.runId, runId),
+          eq(schema.messageBindings.channel, channel),
+          eq(schema.messageBindings.mode, mode)
+        )
+      )
+      .limit(1);
+    return row ? messageBindingSchema.parse(JSON.parse(row.bindingJson)) : undefined;
   }
 
   async getRuntimeValue(key: string) {
@@ -231,6 +319,18 @@ class SqliteRuntimePersistence implements RuntimePersistence {
   async listRuns() {
     const rows = await this.db.select().from(schema.taskRuns).orderBy(desc(schema.taskRuns.createdAt));
     return rows.map((row: any) => taskRunSchema.parse(JSON.parse(row.runJson)));
+  }
+
+  async listRunEvents(runId: string) {
+    const rows = await this.db.select().from(schema.runEvents).where(eq(schema.runEvents.runId, runId));
+    return rows
+      .map((row: any) => runEventSchema.parse(JSON.parse(row.eventJson)))
+      .sort((left: RunEvent, right: RunEvent) => left.createdAt.localeCompare(right.createdAt));
+  }
+
+  async listMessageBindings() {
+    const rows = await this.db.select().from(schema.messageBindings).orderBy(desc(schema.messageBindings.updatedAt));
+    return rows.map((row: any) => messageBindingSchema.parse(JSON.parse(row.bindingJson)));
   }
 
   async saveApproval(ticket: ApprovalTicket) {
@@ -309,6 +409,56 @@ class SqliteRuntimePersistence implements RuntimePersistence {
       });
   }
 
+  async saveRunEvent(event: RunEvent) {
+    await this.db
+      .insert(schema.runEvents)
+      .values({
+        eventId: event.eventId,
+        runId: event.runId,
+        kind: event.kind,
+        eventJson: JSON.stringify(event),
+        createdAt: new Date(event.createdAt)
+      })
+      .onConflictDoUpdate({
+        target: schema.runEvents.eventId,
+        set: {
+          runId: event.runId,
+          kind: event.kind,
+          eventJson: JSON.stringify(event),
+          createdAt: new Date(event.createdAt)
+        }
+      });
+  }
+
+  async saveMessageBinding(binding: MessageBinding) {
+    await this.db
+      .insert(schema.messageBindings)
+      .values({
+        id: binding.id,
+        channel: binding.channel,
+        runId: binding.runId,
+        chatId: binding.chatId,
+        messageId: binding.messageId,
+        mode: binding.mode,
+        bindingJson: JSON.stringify(binding),
+        createdAt: new Date(binding.createdAt),
+        updatedAt: new Date(binding.updatedAt)
+      })
+      .onConflictDoUpdate({
+        target: schema.messageBindings.id,
+        set: {
+          channel: binding.channel,
+          runId: binding.runId,
+          chatId: binding.chatId,
+          messageId: binding.messageId,
+          mode: binding.mode,
+          bindingJson: JSON.stringify(binding),
+          createdAt: new Date(binding.createdAt),
+          updatedAt: new Date(binding.updatedAt)
+        }
+      });
+  }
+
   async setRuntimeValue(key: string, value: string) {
     await this.db
       .insert(schema.runtimeState)
@@ -324,6 +474,10 @@ class SqliteRuntimePersistence implements RuntimePersistence {
           updatedAt: new Date()
         }
       });
+  }
+
+  async deleteMessageBinding(bindingId: string) {
+    await this.db.delete(schema.messageBindings).where(eq(schema.messageBindings.id, bindingId));
   }
 }
 

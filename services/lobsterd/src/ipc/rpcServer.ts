@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import net from "node:net";
 import { mkdirSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
@@ -6,6 +7,7 @@ import type {
   CapabilityCandidate,
   JsonRpcRequest,
   JsonRpcResponse,
+  RunEvent,
   TaskRequest,
   TaskRun
 } from "@lobster/shared";
@@ -22,6 +24,7 @@ import { EvolutionLab } from "../modules/evolutionLab.js";
 import type { RuntimeNotifier } from "../modules/runtimeNotifier.js";
 import type { ChatPluginInstance } from "../modules/chatPluginRegistry.js";
 import type { RuntimeReadinessReport } from "../modules/runtimeReadiness.js";
+import type { RuntimeEventBus } from "../modules/runtimeEventBus.js";
 
 type RuntimeState = {
   approvals: Map<string, ApprovalTicket>;
@@ -31,9 +34,20 @@ type RuntimeState = {
 
 type RpcServerOptions = {
   chatPlugins?: ChatPluginInstance[];
+  eventBus?: RuntimeEventBus;
   notificationWhitelist?: string[];
   runtimeReadinessProvider?: () => Promise<RuntimeReadinessReport> | RuntimeReadinessReport;
 };
+
+const IN_FLIGHT_RUN_STATUSES = new Set<TaskRun["status"]>([
+  "queued",
+  "context_build",
+  "planned",
+  "self_checked",
+  "awaiting_approval",
+  "executing",
+  "verifying"
+]);
 
 export function consumeNewlineDelimitedChunk(buffer: string, chunk: Buffer | string) {
   const nextBuffer = buffer + (typeof chunk === "string" ? chunk : chunk.toString("utf8"));
@@ -50,12 +64,14 @@ export class RpcServer {
   private readonly inboxEngine: InboxEngine;
   private readonly evolutionLab = new EvolutionLab();
   private readonly chatPlugins: ChatPluginInstance[];
+  private readonly eventBus?: RuntimeEventBus;
   private readonly runtimeReadinessProvider?: () => Promise<RuntimeReadinessReport> | RuntimeReadinessReport;
   private readonly state: RuntimeState = {
     approvals: new Map(),
     runs: new Map(),
     runsByRequestKey: new Map()
   };
+  private desktopQueue = Promise.resolve();
 
   constructor(
     private readonly socketPath: string,
@@ -66,9 +82,13 @@ export class RpcServer {
     options: RpcServerOptions = {}
   ) {
     this.chatPlugins = [...(options.chatPlugins ?? [])];
+    this.eventBus = options.eventBus;
     this.runtimeReadinessProvider = options.runtimeReadinessProvider;
     this.orchestrator = new TaskOrchestrator(modelRouter, bridgeClient, {
-      chatPlugins: this.chatPlugins
+      chatPlugins: this.chatPlugins,
+      onRunEvent: async (event, run) => {
+        await this.recordRunEvent(event, run);
+      }
     });
     this.inboxEngine = new InboxEngine({
       notificationWhitelist: options.notificationWhitelist
@@ -111,99 +131,132 @@ export class RpcServer {
   }
 
   async createTask(request: TaskRequest) {
-    const existingRunId = this.state.runsByRequestKey.get(this.requestKey(request));
-    if (existingRunId) {
-      const existingRun = this.state.runs.get(existingRunId) ?? (await this.persistence.getRun(existingRunId));
-      if (existingRun) {
-        return {
-          run: existingRun,
-          approvalTicket: this.findPendingApprovalForRun(existingRun.runId)
-        };
+    return this.runDesktopWork(async () => {
+      const existingRunId = this.state.runsByRequestKey.get(this.requestKey(request));
+      if (existingRunId) {
+        const existingRun = this.state.runs.get(existingRunId) ?? (await this.persistence.getRun(existingRunId));
+        if (existingRun) {
+          return {
+            run: existingRun,
+            approvalTicket: this.findPendingApprovalForRun(existingRun.runId)
+          };
+        }
+        this.state.runsByRequestKey.delete(this.requestKey(request));
       }
-      this.state.runsByRequestKey.delete(this.requestKey(request));
-    }
 
-    const created = await this.orchestrator.createRun(request);
-    await this.persistRunBundle(created.run, created.approvalTicket);
-    await this.notifyTaskCreated(request, created.run, created.approvalTicket);
-    return created;
+      const created = await this.orchestrator.createRun(request);
+      await this.persistRunBundle(created.run, created.approvalTicket);
+      await this.notifyTaskCreated(request, created.run, created.approvalTicket);
+      return created;
+    });
   }
 
   async approveTicket(ticketId: string, approvedBy: string) {
-    const ticket = this.state.approvals.get(ticketId) ?? (await this.persistence.getApproval(ticketId));
-    if (!ticket) {
-      throw new Error(`Approval ticket ${ticketId} not found.`);
-    }
+    return this.runDesktopWork(async () => {
+      const ticket = this.state.approvals.get(ticketId) ?? (await this.persistence.getApproval(ticketId));
+      if (!ticket) {
+        throw new Error(`Approval ticket ${ticketId} not found.`);
+      }
 
-    const run = this.state.runs.get(ticket.runId) ?? (await this.persistence.getRun(ticket.runId));
-    if (!run) {
-      throw new Error(`Task run ${ticket.runId} not found.`);
-    }
+      const run = this.state.runs.get(ticket.runId) ?? (await this.persistence.getRun(ticket.runId));
+      if (!run) {
+        throw new Error(`Task run ${ticket.runId} not found.`);
+      }
 
-    this.assertPendingTicket(ticket);
-    this.assertRunAwaitingApproval(run, ticket.id);
+      this.assertPendingTicket(ticket);
+      this.assertRunAwaitingApproval(run, ticket.id);
 
-    ticket.state = "approved";
-    const token = createApprovalToken({
-      runId: ticket.runId,
-      action: ticket.action,
-      approvedBy,
-      riskLevel: "yellow",
-      expiresAt: new Date(Date.now() + 5 * 60_000).toISOString()
+      const token = createApprovalToken({
+        runId: ticket.runId,
+        action: ticket.action,
+        approvedBy,
+        riskLevel: "yellow",
+        expiresAt: new Date(Date.now() + 5 * 60_000).toISOString()
+      });
+
+      const resumed = await this.orchestrator.resumeRun(run, token);
+      const approvedTicket: ApprovalTicket = {
+        ...ticket,
+        state: "approved"
+      };
+      await this.persistence.saveApproval(approvedTicket);
+      this.state.approvals.set(approvedTicket.id, approvedTicket);
+      await this.recordRunEvent(
+        {
+          eventId: randomUUID(),
+          runId: run.runId,
+          kind: "approval.resolved",
+          status: resumed.run.status,
+          message: "Approval received.",
+          createdAt: new Date().toISOString()
+        },
+        resumed.run
+      );
+      await this.persistRunBundle(resumed.run, resumed.approvalTicket);
+      await this.safeNotify(() =>
+        this.notifier.notifyApprovalResolved(run.request, { ...resumed, approvalTicket: approvedTicket }, "approved")
+      );
+      if (!resumed.approvalTicket) {
+        await this.safeNotify(() => this.notifier.notifyRunSettled(run.request, resumed.run));
+      }
+      return {
+        token,
+        run: resumed.run,
+        approvalTicket: resumed.approvalTicket
+      };
     });
-
-    await this.persistence.saveApproval(ticket);
-    this.state.approvals.set(ticket.id, ticket);
-
-    const resumed = await this.orchestrator.resumeRun(run, token);
-    await this.persistRunBundle(resumed.run, resumed.approvalTicket);
-    await this.safeNotify(() =>
-      this.notifier.notifyApprovalResolved(run.request, resumed, "approved")
-    );
-    if (!resumed.approvalTicket) {
-      await this.safeNotify(() => this.notifier.notifyRunSettled(run.request, resumed.run));
-    }
-    return {
-      token,
-      run: resumed.run,
-      approvalTicket: resumed.approvalTicket
-    };
   }
 
   async denyTicket(ticketId: string) {
-    const ticket = this.state.approvals.get(ticketId) ?? (await this.persistence.getApproval(ticketId));
-    if (!ticket) {
-      throw new Error(`Approval ticket ${ticketId} not found.`);
-    }
+    return this.runDesktopWork(async () => {
+      const ticket = this.state.approvals.get(ticketId) ?? (await this.persistence.getApproval(ticketId));
+      if (!ticket) {
+        throw new Error(`Approval ticket ${ticketId} not found.`);
+      }
 
-    const run = this.state.runs.get(ticket.runId) ?? (await this.persistence.getRun(ticket.runId));
-    this.assertPendingTicket(ticket);
+      const run = this.state.runs.get(ticket.runId) ?? (await this.persistence.getRun(ticket.runId));
+      this.assertPendingTicket(ticket);
 
-    if (run) {
-      this.assertRunAwaitingApproval(run, ticket.id);
-    }
+      if (run) {
+        this.assertRunAwaitingApproval(run, ticket.id);
+      }
 
-    ticket.state = "denied";
-    this.state.approvals.set(ticket.id, ticket);
-    await this.persistence.saveApproval(ticket);
-
-    if (run) {
-      const blockedRun: TaskRun = {
-        ...run,
-        status: "blocked",
-        outcomeSummary: `Approval ticket ${ticket.id} was denied.`,
-        updatedAt: new Date().toISOString()
+      const deniedTicket: ApprovalTicket = {
+        ...ticket,
+        state: "denied"
       };
-      this.state.runs.set(blockedRun.runId, blockedRun);
-      await this.persistence.saveRun(blockedRun);
-      await this.safeNotify(() =>
-        this.notifier.notifyApprovalResolved(run.request, { run: blockedRun, approvalTicket: ticket }, "denied")
-      );
-      await this.safeNotify(() => this.notifier.notifyRunSettled(run.request, blockedRun));
-      return blockedRun;
-    }
+      this.state.approvals.set(ticket.id, deniedTicket);
+      await this.persistence.saveApproval(deniedTicket);
 
-    return undefined;
+      if (run) {
+        const blockedRun: TaskRun = {
+          ...run,
+          status: "blocked",
+          outcomeSummary: `Approval ticket ${ticket.id} was denied.`,
+          updatedAt: new Date().toISOString()
+        };
+        await this.recordRunEvent(
+          {
+            eventId: randomUUID(),
+            runId: blockedRun.runId,
+            kind: "approval.resolved",
+            status: blockedRun.status,
+            message: blockedRun.outcomeSummary ?? "Approval denied.",
+            createdAt: blockedRun.updatedAt
+          },
+          blockedRun
+        );
+        this.state.runs.set(blockedRun.runId, blockedRun);
+        await this.persistence.saveRun(blockedRun);
+        await this.safeNotify(() =>
+          this.notifier.notifyApprovalResolved(run.request, { run: blockedRun, approvalTicket: deniedTicket }, "denied")
+        );
+        await this.safeNotify(() => this.notifier.notifyRunSettled(run.request, blockedRun));
+        return blockedRun;
+      }
+
+      return undefined;
+    });
   }
 
   async ingestNotification(signal: NotificationSignal) {
@@ -257,6 +310,14 @@ export class RpcServer {
     return [...this.state.runs.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
+  async getRun(runId: string) {
+    return this.state.runs.get(runId) ?? this.persistence.getRun(runId);
+  }
+
+  async listRunEvents(runId: string) {
+    return this.persistence.listRunEvents(runId);
+  }
+
   async listApprovals() {
     return [...this.state.approvals.values()].sort((left, right) =>
       right.createdAt.localeCompare(left.createdAt)
@@ -284,6 +345,7 @@ export class RpcServer {
 
     this.inboxEngine.hydrate(inboxItems);
     this.skillRegistry.hydrate(candidates);
+    await this.reconcileRecoveredState();
   }
 
   private async persistRunBundle(run: TaskRun, approvalTicket?: ApprovalTicket) {
@@ -299,7 +361,7 @@ export class RpcServer {
 
   private async notifyTaskCreated(request: TaskRequest, run: TaskRun, approvalTicket?: ApprovalTicket) {
     if (approvalTicket) {
-      await this.safeNotify(() =>
+      this.safeNotify(() =>
         this.notifier.notifyApprovalRequested(request, {
           run,
           approvalTicket
@@ -308,16 +370,44 @@ export class RpcServer {
       return;
     }
 
-    await this.safeNotify(() => this.notifier.notifyRunSettled(request, run));
+    this.safeNotify(() => this.notifier.notifyRunSettled(request, run));
   }
 
-  private async safeNotify(task: () => Promise<void>) {
+  private safeNotify(task: () => Promise<void>) {
+    void Promise.resolve()
+      .then(task)
+      .catch((error) => {
+        console.warn(
+          `Notifier error: ${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+  }
+
+  private async recordRunEvent(event: RunEvent, run: TaskRun) {
+    this.state.runs.set(run.runId, run);
+    this.state.runsByRequestKey.set(this.requestKey(run.request), run.runId);
+    await this.persistence.saveRun(run);
+    await this.persistence.saveRunEvent(event);
+    this.eventBus?.emit({
+      type: "run.event",
+      event,
+      run
+    });
+    this.safeNotify(() => this.notifier.notifyRunEvent(run.request, run, event));
+  }
+
+  private async runDesktopWork<T>(work: () => Promise<T>) {
+    const previous = this.desktopQueue;
+    let release = () => {};
+    this.desktopQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    await previous;
     try {
-      await task();
-    } catch (error) {
-      console.warn(
-        `Notifier error: ${error instanceof Error ? error.message : String(error)}`
-      );
+      return await work();
+    } finally {
+      release();
     }
   }
 
@@ -341,6 +431,70 @@ export class RpcServer {
     if (run.status !== "awaiting_approval") {
       throw new Error(`Task run ${run.runId} is not awaiting approval for ticket ${ticketId}.`);
     }
+  }
+
+  private async reconcileRecoveredState() {
+    const recoveredAt = new Date().toISOString();
+    const pendingApprovalRunIds = new Set<string>();
+
+    for (const approval of [...this.state.approvals.values()]) {
+      if (approval.state !== "pending") {
+        continue;
+      }
+
+      pendingApprovalRunIds.add(approval.runId);
+      const expiredTicket: ApprovalTicket = {
+        ...approval,
+        state: "expired"
+      };
+      this.state.approvals.set(expiredTicket.id, expiredTicket);
+      await this.persistence.saveApproval(expiredTicket);
+    }
+
+    for (const run of [...this.state.runs.values()]) {
+      if (!IN_FLIGHT_RUN_STATUSES.has(run.status)) {
+        continue;
+      }
+
+      const reconciledRun = this.reconcileRecoveredRun(run, recoveredAt, pendingApprovalRunIds.has(run.runId));
+      this.state.runs.set(reconciledRun.runId, reconciledRun);
+      this.state.runsByRequestKey.set(this.requestKey(reconciledRun.request), reconciledRun.runId);
+      await this.persistence.saveRun(reconciledRun);
+
+      const reconciliationEvent: RunEvent = {
+        eventId: randomUUID(),
+        runId: reconciledRun.runId,
+        kind: "run.note",
+        status: reconciledRun.status,
+        stepId: reconciledRun.currentStepId,
+        message: reconciledRun.outcomeSummary ?? "Recovered interrupted run state after daemon restart.",
+        createdAt: recoveredAt
+      };
+      await this.persistence.saveRunEvent(reconciliationEvent);
+
+      this.safeNotify(() => this.notifier.notifyRunEvent(reconciledRun.request, reconciledRun, reconciliationEvent));
+      this.safeNotify(() => this.notifier.notifyRunSettled(reconciledRun.request, reconciledRun));
+    }
+  }
+
+  private reconcileRecoveredRun(run: TaskRun, recoveredAt: string, hadPendingApproval: boolean): TaskRun {
+    if (run.status === "awaiting_approval") {
+      return {
+        ...run,
+        status: "blocked",
+        outcomeSummary: hadPendingApproval
+          ? "Daemon restarted while waiting for approval. The pending approval ticket was expired; review the desktop state and retry the task."
+          : "Daemon restarted while the task was waiting for approval. Review the desktop state and retry the task.",
+        updatedAt: recoveredAt
+      };
+    }
+
+    return {
+      ...run,
+      status: "failed",
+      outcomeSummary: `Daemon restarted while the task was in progress (previous status: ${run.status}). Review the desktop state and retry the task.`,
+      updatedAt: recoveredAt
+    };
   }
 
   private async handleLine(line: string): Promise<JsonRpcResponse> {
@@ -388,8 +542,12 @@ export class RpcServer {
         return this.ingestNotification(params as NotificationSignal);
       case "task.create":
         return this.createTask(params as TaskRequest);
+      case "run.get":
+        return this.getRun((params as { runId: string }).runId);
       case "run.list":
         return this.listRuns();
+      case "run.events":
+        return this.listRunEvents((params as { runId: string }).runId);
       case "approval.list":
         return this.listApprovals();
       case "approval.approve": {

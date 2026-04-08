@@ -11,6 +11,19 @@ type TelegramUpdateResponse = {
 };
 
 type TelegramUpdate = {
+  callback_query?: {
+    data?: string;
+    from?: {
+      id?: number | string;
+    };
+    id?: string;
+    message?: {
+      chat?: {
+        id?: number | string;
+      };
+      message_id?: number;
+    };
+  };
   update_id: number;
   message?: {
     chat?: {
@@ -22,8 +35,10 @@ type TelegramUpdate = {
 };
 
 type TelegramMessageEvent = {
+  callbackQueryId?: string;
   chatId: string;
   eventId: string;
+  messageId?: string;
   receivedAt: string;
   text: string;
 };
@@ -41,12 +56,21 @@ export type TelegramIngressCommand =
     }
   | {
       approvedBy: string;
+      callbackQueryId?: string;
+      chatId: string;
       kind: "approval.approve";
       ticketId: string;
     }
   | {
+      callbackQueryId?: string;
+      chatId: string;
       kind: "approval.deny";
       ticketId: string;
+    }
+  | {
+      chatId: string;
+      kind: "run.status";
+      runId?: string;
     };
 
 type TelegramIngressOptions = {
@@ -160,9 +184,32 @@ export function normalizeTelegramCommandWithMode(
   event: TelegramMessageEvent,
   textMode: "task" | "chat" | "hybrid"
 ): TelegramIngressCommand {
+  const callbackApproveMatch = event.text.match(/^tg:approve:([a-zA-Z0-9-]{6,})$/i);
+  if (callbackApproveMatch?.[1]) {
+    return {
+      callbackQueryId: event.callbackQueryId,
+      chatId: event.chatId,
+      kind: "approval.approve",
+      ticketId: callbackApproveMatch[1],
+      approvedBy: event.chatId
+    };
+  }
+
+  const callbackDenyMatch = event.text.match(/^tg:deny:([a-zA-Z0-9-]{6,})$/i);
+  if (callbackDenyMatch?.[1]) {
+    return {
+      callbackQueryId: event.callbackQueryId,
+      chatId: event.chatId,
+      kind: "approval.deny",
+      ticketId: callbackDenyMatch[1]
+    };
+  }
+
   const approveMatch = event.text.match(/^\s*\/?(?:approve|批准|同意)\s+([a-zA-Z0-9-]{6,})\s*$/i);
   if (approveMatch?.[1]) {
     return {
+      callbackQueryId: event.callbackQueryId,
+      chatId: event.chatId,
       kind: "approval.approve",
       ticketId: approveMatch[1],
       approvedBy: event.chatId
@@ -172,8 +219,19 @@ export function normalizeTelegramCommandWithMode(
   const denyMatch = event.text.match(/^\s*\/?(?:deny|reject|拒绝)\s+([a-zA-Z0-9-]{6,})\s*$/i);
   if (denyMatch?.[1]) {
     return {
+      callbackQueryId: event.callbackQueryId,
+      chatId: event.chatId,
       kind: "approval.deny",
       ticketId: denyMatch[1]
+    };
+  }
+
+  const statusMatch = event.text.match(/^\s*\/?(?:status|状态)(?:\s+([a-zA-Z0-9-]{6,}))?\s*$/i);
+  if (statusMatch) {
+    return {
+      chatId: event.chatId,
+      kind: "run.status",
+      runId: statusMatch[1]?.trim() || undefined
     };
   }
 
@@ -229,6 +287,24 @@ export function decodeTelegramUpdate(
   update: TelegramUpdate,
   allowedChatIds?: Set<string>
 ): TelegramMessageEvent | undefined {
+  const callbackQuery = update.callback_query;
+  if (callbackQuery?.id && callbackQuery.message?.chat?.id !== undefined && callbackQuery.data?.trim()) {
+    const chatId = String(callbackQuery.message.chat.id);
+    if (allowedChatIds && !allowedChatIds.has(chatId)) {
+      return undefined;
+    }
+
+    return {
+      callbackQueryId: callbackQuery.id,
+      chatId,
+      eventId: String(update.update_id),
+      messageId:
+        callbackQuery.message.message_id !== undefined ? String(callbackQuery.message.message_id) : undefined,
+      text: callbackQuery.data.trim(),
+      receivedAt: new Date().toISOString()
+    };
+  }
+
   const text = update.message?.text?.trim();
   const chatIdValue = update.message?.chat?.id;
   if (!text || chatIdValue === undefined || chatIdValue === null) {
@@ -243,6 +319,7 @@ export function decodeTelegramUpdate(
   return {
     chatId,
     eventId: String(update.update_id),
+    messageId: update.message?.message_id !== undefined ? String(update.message.message_id) : undefined,
     text,
     receivedAt: new Date().toISOString()
   };

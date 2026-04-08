@@ -126,6 +126,43 @@ class NonVerifyingBridgeClient implements BridgeClient {
   }
 }
 
+class VisionVerifyingBridgeClient extends NonVerifyingBridgeClient {
+  constructor(private readonly screenshotPath: string) {
+    super();
+  }
+
+  async snapshot(): Promise<DesktopObservation> {
+    const snapshot = await super.snapshot();
+    return {
+      ...snapshot,
+      screenshotPath: this.screenshotPath,
+      observationMode: "hybrid"
+    };
+  }
+}
+
+class OcrTypingBridgeClient extends NonVerifyingBridgeClient {
+  async snapshot(): Promise<DesktopObservation> {
+    const snapshot = await super.snapshot();
+    return {
+      ...snapshot,
+      observationMode: "hybrid",
+      ocrText: ["Search", "hello world"],
+      candidates: [
+        ...snapshot.candidates,
+        {
+          id: "ocr-search",
+          role: "text",
+          label: "Search",
+          value: "hello world",
+          confidence: 0.84,
+          source: "ocr"
+        }
+      ]
+    };
+  }
+}
+
 class RecoveringTypingBridgeClient implements BridgeClient {
   public actionAttempts = 0;
 
@@ -328,22 +365,59 @@ class SemanticCandidatesBridgeClient extends StubBridgeClient {
 
   async snapshot(): Promise<DesktopObservation> {
     const base = await super.snapshot();
+    const seededCandidates =
+      this.options.candidates?.map((candidate, index) => ({
+        id: `semantic-${index}`,
+        role: candidate.role,
+        label: candidate.label,
+        focused: false,
+        confidence: 0.9,
+        source: "ax" as const
+      })) ?? [];
     return {
       ...base,
-      activeApp: this.options.activeApp ?? base.activeApp,
-      activeWindowTitle: this.options.activeWindowTitle ?? base.activeWindowTitle,
-      windows: this.options.windows ?? base.windows,
-      candidates:
-        this.options.candidates?.map((candidate, index) => ({
-          id: `semantic-${index}`,
-          role: candidate.role,
-          label: candidate.label,
-          focused: false,
-          confidence: 0.9,
-          source: "ax" as const
-        })) ?? base.candidates
+      activeApp: base.activeApp !== "Lobster Stub Desktop" ? base.activeApp : this.options.activeApp ?? base.activeApp,
+      activeWindowTitle:
+        base.activeWindowTitle !== "Discovery Workspace" ? base.activeWindowTitle : this.options.activeWindowTitle ?? base.activeWindowTitle,
+      windows: Array.from(new Set([...(base.windows ?? []), ...(this.options.windows ?? [])])),
+      candidates: mergeCandidates([...seededCandidates, ...base.candidates])
     };
   }
+}
+
+class VisionAnsweringRouter extends ModelRouter {
+  constructor(private readonly reply: string) {
+    super(createTestRouter().listProfiles());
+  }
+
+  override async promptWithImage(
+    _role: Parameters<ModelRouter["promptWithImage"]>[0],
+    _input: Parameters<ModelRouter["promptWithImage"]>[1]
+  ): Promise<string> {
+    return this.reply;
+  }
+}
+
+function mergeCandidates(candidates: DesktopObservation["candidates"]) {
+  const merged: DesktopObservation["candidates"] = [];
+  for (const candidate of candidates) {
+    const existing = merged.find(
+      (entry) =>
+        entry.label.toLowerCase() === candidate.label.toLowerCase() &&
+        entry.role.toLowerCase() === candidate.role.toLowerCase()
+    );
+    if (existing) {
+      if (candidate.value !== undefined) {
+        existing.value = candidate.value;
+      }
+      if (candidate.focused !== undefined) {
+        existing.focused = candidate.focused;
+      }
+      continue;
+    }
+    merged.push({ ...candidate });
+  }
+  return merged;
 }
 
 describe("RpcServer runtime flow", () => {
@@ -491,7 +565,7 @@ describe("RpcServer runtime flow", () => {
     rmSync(runtimeDir, { recursive: true, force: true });
   });
 
-  it("runs file upload only after yellow approvals", async () => {
+  it("blocks file upload after approval when only bridge acknowledgement is available", async () => {
     const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
     const persistence = await createRuntimePersistence({
       path: join(runtimeDir, "runtime.sqlite")
@@ -536,8 +610,9 @@ describe("RpcServer runtime flow", () => {
     expect(afterSelectApproval.approvalTicket?.action.kind).toBe("external.upload_file");
 
     const afterUploadApproval = await server.approveTicket(afterSelectApproval.approvalTicket!.id, "tester");
-    expect(afterUploadApproval.run.status).toBe("completed");
-    expect(afterUploadApproval.run.outcomeSummary).toContain("upload was dispatched");
+    expect(afterUploadApproval.run.status).toBe("blocked");
+    expect(afterUploadApproval.run.verification?.status).toBe("dispatched_unverified");
+    expect(afterUploadApproval.run.outcomeSummary).toContain("UI still needs confirmation");
 
     rmSync(runtimeDir, { recursive: true, force: true });
   });
@@ -870,7 +945,7 @@ describe("RpcServer runtime flow", () => {
     rmSync(runtimeDir, { recursive: true, force: true });
   });
 
-  it("accepts bridge contact-selection acknowledgement when snapshot visibility is inconclusive", async () => {
+  it("blocks bridge-only contact-selection acknowledgement when snapshot visibility is inconclusive", async () => {
     const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
     const persistence = await createRuntimePersistence({
       path: join(runtimeDir, "runtime.sqlite")
@@ -908,8 +983,9 @@ describe("RpcServer runtime flow", () => {
     expect(created.approvalTicket?.action.kind).toBe("external.select_contact");
 
     const approved = await server.approveTicket(created.approvalTicket!.id, "tester");
-    expect(approved.run.status).toBe("completed");
-    expect(approved.run.outcomeSummary).toContain("Bridge acknowledged external.select_contact");
+    expect(approved.run.status).toBe("blocked");
+    expect(approved.run.verification?.status).toBe("dispatched_unverified");
+    expect(approved.run.outcomeSummary).toContain("still needs confirmation");
 
     rmSync(runtimeDir, { recursive: true, force: true });
   });
@@ -1312,6 +1388,28 @@ describe("RpcServer runtime flow", () => {
     rmSync(runtimeDir, { recursive: true, force: true });
   });
 
+  it("uses OCR text as a fallback when AX cannot verify typed content", async () => {
+    const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
+    const persistence = await createRuntimePersistence({
+      path: join(runtimeDir, "runtime.sqlite")
+    });
+    const server = new RpcServer(
+      join(runtimeDir, "lobsterd.sock"),
+      createTestRouter(),
+      persistence,
+      new OcrTypingBridgeClient(),
+      new NoopRuntimeNotifier()
+    );
+
+    const created = await server.createTask(createTask('在 "Search" 输入 "hello world"'));
+
+    expect(created.run.status).toBe("completed");
+    expect(created.run.verification?.status).toBe("verified");
+    expect(created.run.outcomeSummary).toContain("OCR text");
+
+    rmSync(runtimeDir, { recursive: true, force: true });
+  });
+
   it("adds a role hint for semantic click targets when candidate metadata is available", async () => {
     const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
     const persistence = await createRuntimePersistence({
@@ -1353,6 +1451,59 @@ describe("RpcServer runtime flow", () => {
     expect(hotkeyStep).toBeDefined();
     expect(hotkeyStep?.action.args.keys).toBe("cmd+k");
     expect(created.run.status).toBe("completed");
+
+    rmSync(runtimeDir, { recursive: true, force: true });
+  });
+
+  it("blocks unverifiable hotkeys instead of auto-completing them", async () => {
+    const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
+    const persistence = await createRuntimePersistence({
+      path: join(runtimeDir, "runtime.sqlite")
+    });
+    const server = new RpcServer(
+      join(runtimeDir, "lobsterd.sock"),
+      createTestRouter(),
+      persistence,
+      new NonVerifyingBridgeClient(),
+      new NoopRuntimeNotifier()
+    );
+
+    const created = await server.createTask(createTask("按下 cmd+k"));
+
+    expect(created.run.plan.some((step) => step.action.kind === "ui.hotkey")).toBe(true);
+    expect(created.run.status).toBe("blocked");
+    expect(created.run.verification?.status).toBe("dispatched_unverified");
+    expect(created.run.outcomeSummary).toContain("not directly verifiable");
+
+    rmSync(runtimeDir, { recursive: true, force: true });
+  });
+
+  it("uses the vision model as a fallback when screenshot evidence is available", async () => {
+    const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
+    const persistence = await createRuntimePersistence({
+      path: join(runtimeDir, "runtime.sqlite")
+    });
+    const screenshotPath = join(runtimeDir, "post-action.png");
+    writeFileSync(screenshotPath, "stub-image");
+    const server = new RpcServer(
+      join(runtimeDir, "lobsterd.sock"),
+      new VisionAnsweringRouter(
+        JSON.stringify({
+          status: "verified",
+          message: "The screenshot shows the quick-open surface after cmd+k.",
+          confidence: 0.93
+        })
+      ),
+      persistence,
+      new VisionVerifyingBridgeClient(screenshotPath),
+      new NoopRuntimeNotifier()
+    );
+
+    const created = await server.createTask(createTask("按下 cmd+k"));
+
+    expect(created.run.status).toBe("completed");
+    expect(created.run.verification?.status).toBe("verified");
+    expect(created.run.outcomeSummary).toContain("quick-open");
 
     rmSync(runtimeDir, { recursive: true, force: true });
   });

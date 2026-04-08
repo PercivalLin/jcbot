@@ -25,6 +25,9 @@ struct BridgeCapabilities: Codable {
     let eventTap: Bool
     let ocr: Bool
     let policyHardGate: Bool
+    let protocolVersion: Int
+    let supportedActions: [String]
+    let observationModes: [String]
 }
 
 struct PolicyValidationResult: Codable {
@@ -32,12 +35,28 @@ struct PolicyValidationResult: Codable {
     let reason: String
 }
 
+struct ApprovalPayload: Codable {
+    let id: String
+    let runId: String
+    let actionFingerprint: String
+    let riskLevel: String
+    let approvedBy: String
+    let expiresAt: String
+    let singleUse: Bool
+}
+
 struct SnapshotResult: Codable {
     let screenshotRef: String
     let activeApp: String
     let activeWindowTitle: String?
     let note: String
+    let ocrText: [String]
     let windows: [String]
+    let snapshotAt: String
+    let screenshotPath: String?
+    let observationMode: String
+    let focusedElement: SnapshotCandidate?
+    let recentEvents: [SnapshotEvent]
     let candidates: [SnapshotCandidate]
 }
 
@@ -63,6 +82,13 @@ struct SnapshotCandidate: Codable {
     let source: String
 }
 
+struct SnapshotEvent: Codable {
+    let id: String
+    let kind: String
+    let message: String
+    let createdAt: String
+}
+
 struct WindowDescriptor {
     let ownerName: String
     let title: String
@@ -70,30 +96,41 @@ struct WindowDescriptor {
 
 struct ActionRequest {
     let actionKind: String
-    let approvalToken: String?
+    let approvalToken: ApprovalPayload?
     let target: String?
     let text: String?
     let args: [String: String]
+    let rawArgs: Any
 
     init(params: [String: String]?) {
         self.actionKind = params?["actionKind"] ?? ""
-        self.approvalToken = params?["approvalToken"]
         self.target = params?["target"]
         self.text = params?["text"]
 
+        if let approvalTokenJson = params?["approvalTokenJson"],
+           let data = approvalTokenJson.data(using: .utf8) {
+            self.approvalToken = try? JSONDecoder().decode(ApprovalPayload.self, from: data)
+        } else {
+            self.approvalToken = nil
+        }
+
         if let argsJson = params?["argsJson"],
            let data = argsJson.data(using: .utf8),
-           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+           let parsed = try? JSONSerialization.jsonObject(with: data) {
+            self.rawArgs = parsed
             var normalized: [String: String] = [:]
-            for (key, value) in parsed {
-                if let stringValue = value as? String {
-                    normalized[key] = stringValue
-                } else {
-                    normalized[key] = String(describing: value)
+            if let dictionary = parsed as? [String: Any] {
+                for (key, value) in dictionary {
+                    if let stringValue = value as? String {
+                        normalized[key] = stringValue
+                    } else {
+                        normalized[key] = String(describing: value)
+                    }
                 }
             }
             self.args = normalized
         } else {
+            self.rawArgs = [String: Any]()
             self.args = [:]
         }
     }

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { ApprovalToken, DesktopAction, DesktopObservation } from "@lobster/shared";
+import { isApprovalTokenValid } from "@lobster/policy";
 import { getKnownApplications, matchKnownApplication, resolveApplicationAlias } from "@lobster/skills";
 
 type BridgeJsonRpcResponse = {
@@ -17,8 +18,11 @@ export type BridgeCapabilities = {
   accessibility: boolean;
   eventTap: boolean;
   ocr: boolean;
+  observationModes?: Array<"accessibility" | "hybrid" | "stub" | "visual">;
   policyHardGate: boolean;
+  protocolVersion?: number;
   screenCapture: boolean;
+  supportedActions?: string[];
 };
 
 export type BridgeActionResult = {
@@ -30,6 +34,7 @@ export interface BridgeClient {
   describeCapabilities(): Promise<BridgeCapabilities>;
   searchApplications(query: string): Promise<string[]>;
   performAction(action: DesktopAction, approvalToken?: ApprovalToken): Promise<BridgeActionResult>;
+  restart?(options?: { args?: string[]; command?: string }): Promise<void>;
   snapshot(): Promise<DesktopObservation>;
   validateAction(action: DesktopAction, approvalToken?: ApprovalToken): Promise<{ allowed: boolean; reason: string }>;
 }
@@ -71,7 +76,9 @@ export class StubBridgeClient implements BridgeClient {
       accessibility: true,
       eventTap: true,
       ocr: true,
+      observationModes: ["stub"],
       policyHardGate: true,
+      protocolVersion: 2,
       screenCapture: true
     };
   }
@@ -185,11 +192,38 @@ export class StubBridgeClient implements BridgeClient {
         candidate.focused = true;
         return { status: `typed:${text.length}` };
       }
+      case "ui.edit_existing": {
+        const instruction =
+          (typeof action.args.instruction === "string" && action.args.instruction.trim()) ||
+          (typeof action.args.text === "string" && action.args.text.trim()) ||
+          action.target ||
+          "edit";
+        this.state.activeWindowTitle = `Edited ${instruction}`;
+        this.state.windows = Array.from(new Set([`Edited ${instruction}`, ...this.state.windows]));
+        return { status: `edited:${instruction}` };
+      }
       case "ui.hotkey": {
         const keys =
           (typeof action.args.keys === "string" && action.args.keys.trim()) ||
           (typeof action.args.hotkey === "string" && action.args.hotkey.trim()) ||
           "unknown";
+        const normalizedKeys = keys.toLowerCase();
+        if (normalizedKeys === "cmd+p") {
+          const picker = this.focusCandidate("Quick Open", "text field");
+          picker.value = "";
+          this.state.activeWindowTitle = "Quick Open";
+          this.state.windows = Array.from(new Set(["Quick Open", ...this.state.windows]));
+        } else if (normalizedKeys === "enter") {
+          const focused =
+            this.state.candidates.find((candidate) => candidate.focused) ??
+            this.focusCandidate(action.target ?? "Current Focus", "text field");
+          const destination = focused.value?.trim() || "Confirmed";
+          this.state.activeWindowTitle = destination;
+          this.state.windows = Array.from(new Set([destination, ...this.state.windows]));
+        } else {
+          this.state.activeWindowTitle = `Shortcut ${keys}`;
+          this.state.windows = Array.from(new Set([`Shortcut ${keys}`, ...this.state.windows]));
+        }
         return { status: `hotkey:${keys}` };
       }
       case "ui.scroll": {
@@ -199,6 +233,8 @@ export class StubBridgeClient implements BridgeClient {
         const amount =
           (typeof action.args.amount === "string" && action.args.amount.trim()) ||
           "320";
+        this.state.activeWindowTitle = `Scrolled ${direction}`;
+        this.state.windows = Array.from(new Set([`Scrolled ${direction}`, ...this.state.windows]));
         return { status: `scrolled:${direction}:${amount}` };
       }
       default:
@@ -233,11 +269,20 @@ export class StubBridgeClient implements BridgeClient {
       };
     }
 
+    if (action.riskLevel === "yellow" && approvalToken && !isApprovalTokenValid(approvalToken, action)) {
+      return {
+        allowed: false,
+        reason: `Stub bridge rejected stale or mismatched approval token for ${action.kind}.`
+      };
+    }
+
     return {
       allowed: true,
       reason: "Action allowed by stub bridge."
     };
   }
+
+  async restart() {}
 
   private resolveApplicationName(action: DesktopAction) {
     const directTarget =
@@ -355,44 +400,57 @@ export class StubBridgeClient implements BridgeClient {
 
 export class ChildProcessBridgeClient implements BridgeClient {
   private process?: ChildProcessWithoutNullStreams;
+  private startPromise?: Promise<void>;
+  private stdoutReader?: ReturnType<typeof createInterface>;
   private readonly pending = new Map<
     string,
     {
       reject: (error: Error) => void;
       resolve: (value: unknown) => void;
+      timeout: NodeJS.Timeout;
     }
   >();
 
-  constructor(private readonly command: string, private readonly args: string[] = []) {}
+  constructor(private command: string, private args: string[] = []) {}
 
   async configureKnownApplications(applications: string[]) {
     await this.request("bridge.configureKnownApplications", {
       appsJson: JSON.stringify(applications)
-    });
+    }, 10_000);
   }
 
   async describeCapabilities() {
-    return (await this.request("bridge.describeCapabilities")) as BridgeCapabilities;
+    const result = (await this.request("bridge.describeCapabilities", undefined, 10_000)) as Partial<BridgeCapabilities>;
+    return {
+      accessibility: Boolean(result.accessibility),
+      eventTap: Boolean(result.eventTap),
+      ocr: Boolean(result.ocr),
+      observationModes: result.observationModes ?? ["accessibility"],
+      policyHardGate: result.policyHardGate !== false,
+      protocolVersion: result.protocolVersion ?? 1,
+      screenCapture: Boolean(result.screenCapture),
+      supportedActions: result.supportedActions ?? []
+    };
   }
 
   async searchApplications(query: string) {
     return (await this.request("bridge.searchApplications", {
       query
-    })) as string[];
+    }, 10_000)) as string[];
   }
 
   async performAction(action: DesktopAction, approvalToken?: ApprovalToken) {
     return (await this.request("ui.performAction", {
       actionKind: action.kind,
-      approvalToken: approvalToken?.id ?? "",
+      approvalTokenJson: approvalToken ? JSON.stringify(approvalToken) : "",
       target: action.target ?? "",
       text: typeof action.args.text === "string" ? action.args.text : "",
       argsJson: JSON.stringify(action.args ?? {})
-    })) as BridgeActionResult;
+    }, 30_000)) as BridgeActionResult;
   }
 
   async snapshot(): Promise<DesktopObservation> {
-    const result = (await this.request("observation.snapshot")) as {
+    const result = (await this.request("observation.snapshot", undefined, 15_000)) as {
       activeApp?: string;
       activeWindowTitle?: string;
       candidates?: Array<{
@@ -410,40 +468,118 @@ export class ChildProcessBridgeClient implements BridgeClient {
         source?: "ax" | "ocr" | "vision" | "dom";
         value?: string;
       }>;
+      focusedElement?: {
+        bounds?: {
+          height: number;
+          width: number;
+          x: number;
+          y: number;
+        };
+        confidence?: number;
+        focused?: boolean;
+        id?: string;
+        label?: string;
+        role?: string;
+        source?: "ax" | "ocr" | "vision" | "dom";
+        value?: string;
+      };
       note?: string;
+      ocrText?: string[];
+      observationMode?: "accessibility" | "hybrid" | "stub" | "visual";
+      recentEvents?: Array<{
+        createdAt?: string;
+        id?: string;
+        kind?: string;
+        message?: string;
+      }>;
       screenshotRef?: string;
+      screenshotPath?: string;
+      snapshotAt?: string;
       windows?: string[];
     };
+    const normalizeCandidate = (candidate: {
+      bounds?: {
+        height: number;
+        width: number;
+        x: number;
+        y: number;
+      };
+      confidence?: number;
+      focused?: boolean;
+      id?: string;
+      label?: string;
+      role?: string;
+      source?: "ax" | "ocr" | "vision" | "dom";
+      value?: string;
+    }) => ({
+      id: candidate.id ?? randomUUID(),
+      role: candidate.role ?? "Unknown",
+      label: candidate.label ?? "",
+      value: typeof candidate.value === "string" ? candidate.value : undefined,
+      focused: typeof candidate.focused === "boolean" ? candidate.focused : undefined,
+      bounds: candidate.bounds,
+      confidence: candidate.confidence ?? 0.5,
+      source: candidate.source ?? "ax"
+    });
 
     return {
       screenshotRef: result.screenshotRef ?? "bridge://unknown",
       activeApp: result.activeApp ?? "Unknown",
       activeWindowTitle: result.activeWindowTitle ?? result.note,
-      ocrText: result.note ? [result.note] : [],
+      ocrText: result.ocrText ?? (result.note ? [result.note] : []),
+      snapshotAt: result.snapshotAt ?? new Date().toISOString(),
+      screenshotPath: result.screenshotPath,
+      observationMode: result.observationMode ?? "accessibility",
+      focusedElement: result.focusedElement ? normalizeCandidate(result.focusedElement) : undefined,
+      recentEvents:
+        result.recentEvents?.map((event) => ({
+          id: event.id ?? randomUUID(),
+          kind: event.kind ?? "bridge.event",
+          message: event.message ?? "",
+          createdAt: event.createdAt ?? new Date().toISOString()
+        })) ?? [],
       windows: result.windows ?? (result.note ? [result.note] : []),
-      candidates:
-        result.candidates?.map((candidate) => ({
-          id: candidate.id ?? randomUUID(),
-          role: candidate.role ?? "Unknown",
-          label: candidate.label ?? "",
-          value: typeof candidate.value === "string" ? candidate.value : undefined,
-          focused: typeof candidate.focused === "boolean" ? candidate.focused : undefined,
-          bounds: candidate.bounds,
-          confidence: candidate.confidence ?? 0.5,
-          source: candidate.source ?? "ax"
-        })) ?? []
+      candidates: result.candidates?.map((candidate) => normalizeCandidate(candidate)) ?? []
     };
   }
 
   async validateAction(action: DesktopAction, approvalToken?: ApprovalToken) {
     return (await this.request("policy.validateAction", {
       actionKind: action.kind,
-      approvalToken: approvalToken?.id ?? ""
-    })) as { allowed: boolean; reason: string };
+      approvalTokenJson: approvalToken ? JSON.stringify(approvalToken) : "",
+      target: action.target ?? "",
+      text: typeof action.args.text === "string" ? action.args.text : "",
+      argsJson: JSON.stringify(action.args ?? {})
+    }, 10_000)) as { allowed: boolean; reason: string };
   }
 
-  private async request(method: string, params?: Record<string, string>) {
-    this.ensureStarted();
+  async restart(options?: { args?: string[]; command?: string }) {
+    if (options?.command) {
+      this.command = options.command;
+    }
+    if (options?.args) {
+      this.args = [...options.args];
+    }
+
+    this.startPromise = undefined;
+    if (!this.process) {
+      return;
+    }
+
+    const processToStop = this.process;
+    this.process = undefined;
+    this.stdoutReader?.close();
+    this.stdoutReader = undefined;
+    this.rejectPendingRequests(new Error("Bridge process restarted."));
+    processToStop.kill();
+  }
+
+  private async request(method: string, params?: Record<string, string>, timeoutMs = this.timeoutForMethod(method)) {
+    await this.ensureStarted();
+    const bridgeProcess = this.process;
+    if (!bridgeProcess) {
+      throw new Error(`Bridge process is not running for request ${method}.`);
+    }
 
     const id = randomUUID();
     const payload = JSON.stringify({
@@ -454,76 +590,217 @@ export class ChildProcessBridgeClient implements BridgeClient {
     });
 
     return await new Promise<unknown>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.process?.stdin.write(`${payload}\n`, "utf8", (error) => {
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Bridge request timed out after ${timeoutMs}ms (${method}).`));
+        void this.restart().catch((error) => {
+          console.warn(`Bridge restart after timeout failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timeout });
+      bridgeProcess.stdin.write(`${payload}\n`, "utf8", (error) => {
         if (error) {
-          this.pending.delete(id);
+          const pending = this.pending.get(id);
+          if (pending) {
+            clearTimeout(pending.timeout);
+            this.pending.delete(id);
+          }
           reject(error);
         }
       });
     });
   }
 
-  private ensureStarted() {
+  private async ensureStarted() {
     if (this.process) {
       return;
     }
 
-    this.process = spawn(this.command, this.args, {
-      stdio: ["pipe", "pipe", "pipe"]
-    });
+    if (this.startPromise) {
+      return this.startPromise;
+    }
 
-    const stdout = createInterface({ input: this.process.stdout });
-    stdout.on("line", (line) => {
-      try {
-        const response = JSON.parse(line) as BridgeJsonRpcResponse;
-        const pending = this.pending.get(response.id);
-        if (!pending) {
+    this.startPromise = new Promise<void>((resolve, reject) => {
+      const child = spawn(this.command, this.args, {
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+      this.process = child;
+
+      let started = false;
+      const failStart = (error: Error) => {
+        if (this.process === child) {
+          this.process = undefined;
+        }
+        this.stdoutReader?.close();
+        this.stdoutReader = undefined;
+        this.rejectPendingRequests(error);
+        if (!started) {
+          reject(error);
+        }
+      };
+
+      child.once("spawn", () => {
+        started = true;
+        resolve();
+      });
+
+      child.once("error", (error) => {
+        const wrapped =
+          error instanceof Error
+            ? new Error(`Failed to start bridge process "${this.command}": ${error.message}`)
+            : new Error(`Failed to start bridge process "${this.command}".`);
+        failStart(wrapped);
+      });
+
+      const stdout = createInterface({ input: child.stdout });
+      this.stdoutReader = stdout;
+      stdout.on("line", (line) => {
+        try {
+          const response = JSON.parse(line) as BridgeJsonRpcResponse;
+          const pending = this.pending.get(response.id);
+          if (!pending) {
+            return;
+          }
+
+          this.pending.delete(response.id);
+          clearTimeout(pending.timeout);
+          if (response.error) {
+            pending.reject(new Error(response.error.message));
+            return;
+          }
+
+          pending.resolve(response.result);
+        } catch (error) {
+          this.rejectPendingRequests(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+
+      child.stderr.on("data", (chunk) => {
+        const message = chunk.toString("utf8").trim();
+        if (message) {
+          console.warn(`[lobster-bridge] ${message}`);
+        }
+      });
+
+      child.once("exit", (code, signal) => {
+        if (this.process === child) {
+          this.process = undefined;
+        }
+        this.stdoutReader?.close();
+        this.stdoutReader = undefined;
+        const exitError = new Error(
+          `Bridge process exited unexpectedly with code ${code ?? "unknown"} and signal ${signal ?? "none"}.`
+        );
+        if (!started) {
+          reject(exitError);
           return;
         }
-
-        this.pending.delete(response.id);
-        if (response.error) {
-          pending.reject(new Error(response.error.message));
-          return;
-        }
-
-        pending.resolve(response.result);
-      } catch (error) {
-        for (const [, pending] of this.pending) {
-          pending.reject(error instanceof Error ? error : new Error(String(error)));
-        }
-        this.pending.clear();
-      }
+        this.rejectPendingRequests(exitError);
+      });
     });
 
-    this.process.stderr.on("data", (chunk) => {
-      const message = chunk.toString("utf8").trim();
-      if (message) {
-        console.warn(`[lobster-bridge] ${message}`);
-      }
-    });
+    try {
+      await this.startPromise;
+    } finally {
+      this.startPromise = undefined;
+    }
+  }
 
-    this.process.once("exit", (code, signal) => {
-      const reason = new Error(
-        `Bridge process exited unexpectedly with code ${code ?? "unknown"} and signal ${signal ?? "none"}.`
-      );
+  private rejectPendingRequests(reason: Error) {
+    for (const [, pending] of this.pending) {
+      clearTimeout(pending.timeout);
+      pending.reject(reason);
+    }
+    this.pending.clear();
+  }
 
-      for (const [, pending] of this.pending) {
-        pending.reject(reason);
-      }
-      this.pending.clear();
-      this.process = undefined;
-    });
+  private timeoutForMethod(method: string) {
+    switch (method) {
+      case "bridge.configureKnownApplications":
+      case "bridge.describeCapabilities":
+      case "bridge.searchApplications":
+      case "policy.validateAction":
+        return 10_000;
+      case "observation.snapshot":
+        return 15_000;
+      case "ui.performAction":
+        return 30_000;
+      default:
+        return 15_000;
+    }
   }
 }
 
 export function createBridgeClient(): BridgeClient {
-  const bridgeBinary = process.env.LOBSTER_BRIDGE_BIN;
-  if (!bridgeBinary) {
+  const bridgeBinary = normalizeBridgeBinary(process.env.LOBSTER_BRIDGE_BIN);
+  const args = process.env.LOBSTER_BRIDGE_ARGS?.split(" ").filter(Boolean) ?? [];
+  return new ManagedBridgeClient(bridgeBinary, args);
+}
+
+class ManagedBridgeClient implements BridgeClient {
+  private inner: BridgeClient;
+
+  constructor(private command?: string, private args: string[] = []) {
+    this.inner = instantiateBridgeClient(command, args);
+  }
+
+  async configureKnownApplications(applications: string[]) {
+    await this.inner.configureKnownApplications(applications);
+  }
+
+  async describeCapabilities() {
+    return this.inner.describeCapabilities();
+  }
+
+  async searchApplications(query: string) {
+    return this.inner.searchApplications(query);
+  }
+
+  async performAction(action: DesktopAction, approvalToken?: ApprovalToken) {
+    return this.inner.performAction(action, approvalToken);
+  }
+
+  async snapshot() {
+    return this.inner.snapshot();
+  }
+
+  async validateAction(action: DesktopAction, approvalToken?: ApprovalToken) {
+    return this.inner.validateAction(action, approvalToken);
+  }
+
+  async restart(options?: { args?: string[]; command?: string }) {
+    const nextCommand = normalizeBridgeBinary(options?.command ?? this.command);
+    const nextArgs = options?.args ? [...options.args] : [...this.args];
+    const shouldSwapImplementation =
+      (this.inner instanceof StubBridgeClient && Boolean(nextCommand)) ||
+      (this.inner instanceof ChildProcessBridgeClient && !nextCommand);
+
+    if (shouldSwapImplementation) {
+      await this.inner.restart?.();
+      this.command = nextCommand;
+      this.args = nextArgs;
+      this.inner = instantiateBridgeClient(nextCommand, nextArgs);
+      return;
+    }
+
+    this.command = nextCommand;
+    this.args = nextArgs;
+    await this.inner.restart?.({
+      command: nextCommand,
+      args: nextArgs
+    });
+  }
+}
+
+function instantiateBridgeClient(command: string | undefined, args: string[]) {
+  if (!command) {
     return new StubBridgeClient();
   }
 
-  const args = process.env.LOBSTER_BRIDGE_ARGS?.split(" ").filter(Boolean) ?? [];
-  return new ChildProcessBridgeClient(bridgeBinary, args);
+  return new ChildProcessBridgeClient(command, args);
+}
+
+function normalizeBridgeBinary(value: string | undefined) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }

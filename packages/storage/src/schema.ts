@@ -33,3 +33,23 @@ export const runtimeState = sqliteTable("runtime_state", {
   value: text("value").notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull()
 });
+
+export const runEvents = sqliteTable("run_events", {
+  eventId: text("event_id").primaryKey(),
+  runId: text("run_id").notNull(),
+  kind: text("kind").notNull(),
+  eventJson: text("event_json").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull()
+});
+
+export const messageBindings = sqliteTable("message_bindings", {
+  id: text("id").primaryKey(),
+  channel: text("channel").notNull(),
+  runId: text("run_id").notNull(),
+  chatId: text("chat_id").notNull(),
+  messageId: text("message_id").notNull(),
+  mode: text("mode").notNull(),
+  bindingJson: text("binding_json").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull()
+});

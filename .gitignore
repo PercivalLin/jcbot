@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+coverage/
+*.tsbuildinfo
+apps/desktop/out/
+apps/desktop/.vite/
+apps/desktop/dist/
+apps/desktop/dist-electron/
+native/lobster-bridge/.build/
+
+# Runtime state and artifacts
+artifacts/
+tmp/
+logs/
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+services/lobsterd/.runtime/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+config/runtime.env
+config/runtime.*.env
+!config/runtime.env.example
+config/secrets/
+config/certs/
+
+# Editor / OS noise
+.DS_Store
+._*
+.idea/
+.vscode/
+pnpm-debug.log*

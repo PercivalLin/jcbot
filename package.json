@@ -1,0 +1,28 @@
+{
+  "name": "lobster",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.11.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "dev:daemon": "pnpm --filter lobsterd run start",
+    "dev:daemon:oneclick": "pnpm --filter lobsterd run bridge:prepare && pnpm --filter lobsterd run start",
+    "init:daemon": "pnpm --filter lobsterd run init",
+    "reset:daemon": "pnpm --filter lobsterd run reset",
+    "dev:app": "pnpm --filter lobster-app dev"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.1",
+    "prettier": "^3.5.3",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.9"
+  }
+}

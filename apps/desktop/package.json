@@ -1,0 +1,28 @@
+{
+  "name": "lobster-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist-electron/apps/desktop/electron/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.node.json && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit",
+    "test": "vitest run --passWithNoTests --exclude '**/._*'",
+    "lint": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@lobster/shared": "workspace:*",
+    "@tanstack/react-query": "^5.69.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zustand": "^5.0.3"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.12",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^35.0.1",
+    "vite": "^6.2.2"
+  }
+}

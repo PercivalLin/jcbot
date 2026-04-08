@@ -1,0 +1,61 @@
+version: 1
+packs:
+  core:
+    title: Lobster Core Constitution
+    rules:
+      - id: redline.outbound-message
+        level: red
+        actionKinds:
+          - external.send_message
+        summary: Never send external messages without an approval token.
+        alternative: Draft the message and request approval.
+      - id: caution.upload-file
+        level: yellow
+        actionKinds:
+          - external.upload_file
+        summary: Uploading files requires a one-time approval token.
+        alternative: Prepare file selection context, then request approval before upload.
+      - id: redline.delete-record
+        level: red
+        actionKinds:
+          - file.delete
+          - record.delete
+        summary: Never delete files or records automatically.
+        alternative: Propose an archive or move operation and ask for approval.
+      - id: redline.payment
+        level: red
+        actionKinds:
+          - commerce.pay
+          - commerce.checkout
+        summary: Never perform payments or transactions.
+        alternative: Stop and ask the user to complete the payment manually.
+      - id: redline.security-policy
+        level: red
+        actionKinds:
+          - policy.modify
+          - runtime.modify
+          - bridge.modify
+          - security.privilege_escalation
+        summary: Never change policy, runtime, bridge, or security settings.
+        alternative: Explain the restriction and provide a safe manual path.
+      - id: caution.contact-switch
+        level: yellow
+        actionKinds:
+          - external.select_contact
+        summary: Contact resolution must be verified before continuing.
+        alternative: Ask the user to confirm the selected contact.
+      - id: caution.edit-existing
+        level: yellow
+        actionKinds:
+          - ui.edit_existing
+        summary: Editing existing content requires strong verification.
+        alternative: Snapshot the current state, apply the edit, and verify the diff.
+      - id: allow.discovery
+        level: green
+        actionKinds:
+          - ui.open_app
+          - ui.navigate
+          - ui.inspect
+          - ui.read
+        summary: Reading and navigation are allowed in discovery mode.
+        alternative: n/a

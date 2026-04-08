@@ -1,0 +1,43 @@
+version: 1
+instances:
+  - id: wechat-main
+    appName: WeChat
+    aliases:
+      - 微信
+    enabled: true
+    capabilities:
+      - external.select_contact
+      - ui.type_into_target
+      - ui.click_target
+    strategy:
+      contactSearchLabels:
+        - 搜索
+        - 联系人
+      composerLabels:
+        - 输入
+        - 输入消息
+      sendButtonLabels:
+        - 发送
+      attachmentButtonLabels:
+        - +
+        - 附件
+
+  - id: whatsapp-main
+    appName: WhatsApp
+    aliases:
+      - WA
+    enabled: true
+    capabilities:
+      - external.select_contact
+      - ui.type_into_target
+      - ui.click_target
+    strategy:
+      contactSearchLabels:
+        - Search
+      composerLabels:
+        - Message
+      sendButtonLabels:
+        - Send
+      attachmentButtonLabels:
+        - +
+        - Attach

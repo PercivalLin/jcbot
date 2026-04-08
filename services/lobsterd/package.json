@@ -1,0 +1,38 @@
+{
+  "name": "lobsterd",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/services/lobsterd/src/index.js",
+  "types": "./dist/services/lobsterd/src/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --exclude '**/._*'",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/tools/start.ts",
+    "bridge:prepare": "tsx src/tools/bridgePrepare.ts",
+    "init": "tsx src/tools/bootstrap.ts",
+    "reset": "tsx src/tools/reset.ts",
+    "chat:repl": "tsx src/tools/localChatRepl.ts",
+    "doctor": "tsx src/tools/doctor.ts",
+    "model:probe": "tsx src/tools/modelProbe.ts",
+    "telegram:whoami": "tsx src/tools/telegramQuickstart.ts",
+    "telegram:doctor": "tsx src/tools/telegramDoctor.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^1.1.11",
+    "@ai-sdk/google": "^1.1.17",
+    "@ai-sdk/openai": "^1.1.15",
+    "@langchain/langgraph": "^0.2.39",
+    "@lobster/policy": "workspace:*",
+    "@lobster/shared": "workspace:*",
+    "@lobster/skills": "workspace:*",
+    "@lobster/storage": "workspace:*",
+    "ai": "^4.1.46",
+    "nanoid": "^5.1.3",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.2"
+  }
+}

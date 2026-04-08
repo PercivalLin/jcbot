@@ -173,6 +173,96 @@ final class LobsterBridgeTests: XCTestCase {
         XCTAssertTrue(result?.contains(where: { $0.localizedCaseInsensitiveContains("Safari") }) ?? false)
     }
 
+    func testActionRequestParsesFirstClassTargetDescriptor() {
+        let action = ActionRequest(params: [
+            "actionKind": "ui.click_target",
+            "target": "Lobster OCR",
+            "targetDescriptorJson": """
+            {"candidateId":"ocr-1","label":"Lobster OCR","role":"text","source":"ocr","bounds":{"x":12,"y":24,"width":160,"height":32},"snapshotRef":"bridge://snapshot/test","snapshotAt":"2026-04-08T12:00:00Z"}
+            """
+        ])
+
+        XCTAssertEqual(action.targetDescriptor?.candidateId, "ocr-1")
+        XCTAssertEqual(action.targetDescriptor?.label, "Lobster OCR")
+        XCTAssertEqual(action.targetDescriptor?.source, "ocr")
+        XCTAssertEqual(action.targetDescriptor?.bounds?.width, 160)
+        XCTAssertEqual(action.targetDescriptor?.snapshotRef, "bridge://snapshot/test")
+    }
+
+    func testValidatedBoundsFallbackAcceptsFreshOCRDescriptor() {
+        let service = BridgeService()
+        let snapshot = latestSnapshotInfo(from: service)
+        let action = ActionRequest(params: [
+            "actionKind": "ui.click_target",
+            "target": "Lobster OCR",
+            "targetDescriptorJson": descriptorJson(
+                label: "Lobster OCR",
+                source: "ocr",
+                snapshotRef: snapshot.ref,
+                snapshotAt: snapshot.at
+            )
+        ])
+
+        let bounds = service.validatedBoundsFallback(for: action.targetDescriptor, targetLabel: "Lobster OCR")
+        XCTAssertNotNil(bounds)
+        XCTAssertEqual(bounds?.x, 48)
+        XCTAssertEqual(bounds?.width, 200)
+    }
+
+    func testValidatedBoundsFallbackRejectsStaleDescriptor() {
+        let service = BridgeService()
+        _ = latestSnapshotInfo(from: service)
+        let action = ActionRequest(params: [
+            "actionKind": "ui.click_target",
+            "target": "Lobster OCR",
+            "targetDescriptorJson": descriptorJson(
+                label: "Lobster OCR",
+                source: "ocr",
+                snapshotRef: "bridge://snapshot/stale",
+                snapshotAt: "2026-04-08T12:00:00Z"
+            )
+        ])
+
+        let bounds = service.validatedBoundsFallback(for: action.targetDescriptor, targetLabel: "Lobster OCR")
+        XCTAssertNil(bounds)
+    }
+
+    func testValidatedBoundsFallbackRejectsNonVisualDescriptor() {
+        let service = BridgeService()
+        let snapshot = latestSnapshotInfo(from: service)
+        let action = ActionRequest(params: [
+            "actionKind": "ui.click_target",
+            "target": "Primary Button",
+            "targetDescriptorJson": descriptorJson(
+                label: "Primary Button",
+                source: "ax",
+                snapshotRef: snapshot.ref,
+                snapshotAt: snapshot.at
+            )
+        ])
+
+        let bounds = service.validatedBoundsFallback(for: action.targetDescriptor, targetLabel: "Primary Button")
+        XCTAssertNil(bounds)
+    }
+
+    func testValidatedBoundsFallbackRejectsMismatchedLabel() {
+        let service = BridgeService()
+        let snapshot = latestSnapshotInfo(from: service)
+        let action = ActionRequest(params: [
+            "actionKind": "ui.click_target",
+            "target": "Different Label",
+            "targetDescriptorJson": descriptorJson(
+                label: "Lobster OCR",
+                source: "vision",
+                snapshotRef: snapshot.ref,
+                snapshotAt: snapshot.at
+            )
+        ])
+
+        let bounds = service.validatedBoundsFallback(for: action.targetDescriptor, targetLabel: "Different Label")
+        XCTAssertNil(bounds)
+    }
+
     func testUploadWithoutPathReturnsNoop() {
         let service = BridgeService()
         let request = rpcRequest(
@@ -236,6 +326,25 @@ final class LobsterBridgeTests: XCTestCase {
 
         let data = try! JSONSerialization.data(withJSONObject: payload, options: [])
         return String(decoding: data, as: UTF8.self)
+    }
+
+    private func latestSnapshotInfo(from service: BridgeService) -> (ref: String, at: String) {
+        let request = """
+        {"jsonrpc":"2.0","id":"snapshot","method":"observation.snapshot"}
+        """
+        let response = service.handle(line: request)
+        let payload = try! JSONSerialization.jsonObject(with: Data(response.utf8)) as! [String: Any]
+        let result = payload["result"] as! [String: Any]
+        return (
+            ref: result["screenshotRef"] as! String,
+            at: result["snapshotAt"] as! String
+        )
+    }
+
+    private func descriptorJson(label: String, source: String, snapshotRef: String, snapshotAt: String) -> String {
+        """
+        {"candidateId":"\(source)-1","label":"\(label)","role":"text","source":"\(source)","bounds":{"x":48,"y":72,"width":200,"height":40},"snapshotRef":"\(snapshotRef)","snapshotAt":"\(snapshotAt)"}
+        """
     }
 
     private func makeTextImage(text: String, fileName: String) throws -> String {

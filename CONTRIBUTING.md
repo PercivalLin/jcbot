@@ -2,6 +2,15 @@
 
 Lobster is an early-stage, approval-gated macOS computer-use project. Keep contributions small, reviewable, and safe by default.
 
+## Core engineering principle
+
+First-principles reasoning is the project's top development rule.
+
+- Start from what must be true in the real system, not from analogy or UI-level assumptions.
+- Prefer explicit state, explicit contracts, and verifiable evidence over heuristics hidden in prompts or glue code.
+- When a feature is brittle, reduce it to observation, decision, execution, and verification, then fix the weakest layer directly.
+- If a shortcut conflicts with reliability, recoverability, or operator trust, choose the more fundamental design even if it takes longer.
+
 ## Before you open a PR
 
 - Run `pnpm typecheck` and `pnpm test`.

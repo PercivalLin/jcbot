@@ -445,7 +445,8 @@ export class ChildProcessBridgeClient implements BridgeClient {
       approvalTokenJson: approvalToken ? JSON.stringify(approvalToken) : "",
       target: action.target ?? "",
       text: typeof action.args.text === "string" ? action.args.text : "",
-      argsJson: JSON.stringify(action.args ?? {})
+      argsJson: JSON.stringify(action.args ?? {}),
+      targetDescriptorJson: action.targetDescriptor ? JSON.stringify(action.targetDescriptor) : ""
     }, 30_000)) as BridgeActionResult;
   }
 
@@ -549,7 +550,8 @@ export class ChildProcessBridgeClient implements BridgeClient {
       approvalTokenJson: approvalToken ? JSON.stringify(approvalToken) : "",
       target: action.target ?? "",
       text: typeof action.args.text === "string" ? action.args.text : "",
-      argsJson: JSON.stringify(action.args ?? {})
+      argsJson: JSON.stringify(action.args ?? {}),
+      targetDescriptorJson: action.targetDescriptor ? JSON.stringify(action.targetDescriptor) : ""
     }, 10_000)) as { allowed: boolean; reason: string };
   }
 

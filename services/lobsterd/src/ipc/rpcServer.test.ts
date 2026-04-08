@@ -163,6 +163,37 @@ class OcrTypingBridgeClient extends NonVerifyingBridgeClient {
   }
 }
 
+class OcrOnlyTargetBridgeClient extends NonVerifyingBridgeClient {
+  async snapshot(): Promise<DesktopObservation> {
+    return {
+      screenshotRef: "stub://snapshot/ocr-only",
+      snapshotAt: "2026-01-01T00:00:05.000Z",
+      activeApp: "Finder",
+      activeWindowTitle: "Finder Window",
+      observationMode: "hybrid",
+      ocrText: ["Search"],
+      windows: ["Finder Window"],
+      candidates: [
+        {
+          id: "ocr-search",
+          role: "text",
+          label: "Search",
+          value: "Search",
+          focused: false,
+          confidence: 0.84,
+          source: "ocr",
+          bounds: {
+            x: 120,
+            y: 80,
+            width: 140,
+            height: 32
+          }
+        }
+      ]
+    };
+  }
+}
+
 class RecoveringTypingBridgeClient implements BridgeClient {
   public actionAttempts = 0;
 
@@ -1406,6 +1437,35 @@ describe("RpcServer runtime flow", () => {
     expect(created.run.status).toBe("completed");
     expect(created.run.verification?.status).toBe("verified");
     expect(created.run.outcomeSummary).toContain("OCR text");
+
+    rmSync(runtimeDir, { recursive: true, force: true });
+  });
+
+  it("threads OCR target provenance into planned actions", async () => {
+    const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
+    const persistence = await createRuntimePersistence({
+      path: join(runtimeDir, "runtime.sqlite")
+    });
+    const server = new RpcServer(
+      join(runtimeDir, "lobsterd.sock"),
+      createTestRouter(),
+      persistence,
+      new OcrOnlyTargetBridgeClient(),
+      new NoopRuntimeNotifier()
+    );
+
+    const created = await server.createTask(createTask('click "Search"'));
+
+    const clickStep = created.run.plan.find((step) => step.action.kind === "ui.click_target");
+    expect(clickStep).toBeDefined();
+    expect(clickStep?.action.targetDescriptor).toMatchObject({
+      candidateId: "ocr-search",
+      label: "Search",
+      source: "ocr",
+      screenshotRef: "stub://snapshot/ocr-only",
+      snapshotAt: "2026-01-01T00:00:05.000Z"
+    });
+    expect(clickStep?.action.targetDescriptor).toHaveProperty("bounds");
 
     rmSync(runtimeDir, { recursive: true, force: true });
   });

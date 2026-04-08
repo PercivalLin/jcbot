@@ -65,6 +65,17 @@ export const uiCandidateSchema = z.object({
 });
 export type UiCandidate = z.infer<typeof uiCandidateSchema>;
 
+export const targetDescriptorSchema = z.object({
+  candidateId: z.string(),
+  label: z.string(),
+  role: z.string().optional(),
+  source: uiCandidateSchema.shape.source,
+  bounds: uiCandidateSchema.shape.bounds.optional(),
+  screenshotRef: z.string().optional(),
+  snapshotAt: z.string().optional()
+});
+export type TargetDescriptor = z.infer<typeof targetDescriptorSchema>;
+
 export const desktopObservationEventSchema = z.object({
   id: z.string(),
   kind: z.string(),
@@ -94,6 +105,7 @@ export const desktopActionSchema = z.object({
   kind: z.string(),
   target: z.string().optional(),
   args: z.record(z.string(), z.unknown()).default({}),
+  targetDescriptor: targetDescriptorSchema.optional(),
   riskLevel: riskLevelSchema.default("green"),
   preconditions: z.array(z.string()).default([]),
   successCheck: z.array(z.string()).default([])

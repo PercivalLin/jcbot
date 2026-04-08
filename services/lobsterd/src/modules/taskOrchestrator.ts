@@ -13,6 +13,7 @@ import {
   type SelfCheckResult,
   type TaskRequest,
   type TaskRun,
+  type TargetDescriptor,
   type VerificationEvidenceItem,
   type VerificationResult
 } from "@lobster/shared";
@@ -1069,15 +1070,16 @@ export class TaskOrchestrator {
       chatPlugins: this.options.chatPlugins
     });
     if (templatePlan) {
-      return templatePlan.plan;
+      return this.hydratePlanTargetDescriptors(templatePlan.plan, observation);
     }
 
     const plannerOutput = await this.modelRouter.prompt("planner", buildPlannerPrompt(request.text, observation));
 
     const heuristicPlan = await this.buildHeuristicPlan(request.text, observation, plannerOutput);
-    return heuristicPlan.length > 0
-      ? heuristicPlan
-      : [
+    const plan =
+      heuristicPlan.length > 0
+        ? heuristicPlan
+        : [
           {
             id: randomUUID(),
             title: "Inspect task context",
@@ -1087,6 +1089,7 @@ export class TaskOrchestrator {
             successCriteria: ["Target app is opened or focused", "Relevant UI candidates are identified"]
           }
         ];
+    return this.hydratePlanTargetDescriptors(plan, observation);
   }
 
   private createDiscoveryAction(text: string): DesktopAction {
@@ -3242,6 +3245,111 @@ export class TaskOrchestrator {
       observation.candidates.find((candidate) => this.normalize(candidate.label) === normalizedTarget) ??
       observation.candidates.find((candidate) => this.normalize(candidate.label).includes(normalizedTarget))
     );
+  }
+
+  private hydratePlanTargetDescriptors(plan: TaskRun["plan"], observation: DesktopObservation | undefined) {
+    if (!observation) {
+      return plan;
+    }
+
+    return plan.map((step) => ({
+      ...step,
+      action: this.hydrateActionTargetDescriptor(step.action, observation)
+    }));
+  }
+
+  private hydrateActionTargetDescriptor(action: DesktopAction, observation: DesktopObservation) {
+    if (this.extractTargetDescriptor(action)) {
+      return action;
+    }
+
+    const label = this.resolveDescriptorLabel(action);
+    if (!label) {
+      return action;
+    }
+
+    const preferredRole =
+      action.kind === "external.select_contact" ? undefined : this.resolveActionRole(action);
+    const candidate = this.findCandidateByLabel(observation, label, preferredRole);
+    if (!candidate) {
+      return action;
+    }
+
+    const descriptor: TargetDescriptor = {
+      candidateId: candidate.id,
+      label: candidate.label,
+      role: candidate.role,
+      source: candidate.source,
+      bounds: candidate.bounds,
+      screenshotRef: observation.screenshotRef,
+      snapshotAt: observation.snapshotAt
+    };
+
+    return {
+      ...action,
+      targetDescriptor: descriptor
+    };
+  }
+
+  private resolveDescriptorLabel(action: DesktopAction) {
+    switch (action.kind) {
+      case "ui.focus_target":
+      case "ui.click_target":
+      case "ui.type_into_target":
+        return this.resolveActionTargetLabel(action);
+      case "external.select_contact":
+        return this.resolveActionContactName(action);
+      default:
+        return undefined;
+    }
+  }
+
+  private extractTargetDescriptor(action: DesktopAction) {
+    return this.parseTargetDescriptor(action.targetDescriptor) ?? this.parseTargetDescriptor(action.args.targetDescriptor);
+  }
+
+  private parseTargetDescriptor(raw: unknown) {
+    if (!raw || typeof raw !== "object") {
+      return undefined;
+    }
+
+    const candidateId = "candidateId" in raw && typeof raw.candidateId === "string" ? raw.candidateId : undefined;
+    const label = "label" in raw && typeof raw.label === "string" ? raw.label : undefined;
+    const sourceValue = "source" in raw && typeof raw.source === "string" ? raw.source : undefined;
+    const source =
+      sourceValue && ["ax", "ocr", "vision", "dom"].includes(sourceValue)
+        ? (sourceValue as TargetDescriptor["source"])
+        : undefined;
+    if (!candidateId || !label || !source) {
+      return undefined;
+    }
+
+    const boundsRecord =
+      "bounds" in raw && raw.bounds && typeof raw.bounds === "object"
+        ? (raw.bounds as Record<string, unknown>)
+        : undefined;
+
+    return {
+      bounds:
+        boundsRecord &&
+        typeof boundsRecord.x === "number" &&
+        typeof boundsRecord.y === "number" &&
+        typeof boundsRecord.width === "number" &&
+        typeof boundsRecord.height === "number"
+          ? {
+              x: boundsRecord.x,
+              y: boundsRecord.y,
+              width: boundsRecord.width,
+              height: boundsRecord.height
+            }
+          : undefined,
+      candidateId,
+      label,
+      role: "role" in raw && typeof raw.role === "string" ? raw.role : undefined,
+      screenshotRef: "screenshotRef" in raw && typeof raw.screenshotRef === "string" ? raw.screenshotRef : undefined,
+      snapshotAt: "snapshotAt" in raw && typeof raw.snapshotAt === "string" ? raw.snapshotAt : undefined,
+      source
+    } satisfies TargetDescriptor;
   }
 
   private focusedElementMatches(observation: DesktopObservation | undefined, label: string, preferredRole?: string) {

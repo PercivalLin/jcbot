@@ -71,6 +71,50 @@ struct SnapshotBounds: Codable {
     let height: Double
 }
 
+struct TargetDescriptor: Codable {
+    let candidateId: String?
+    let label: String?
+    let role: String?
+    let source: String
+    let bounds: SnapshotBounds?
+    let snapshotRef: String
+    let snapshotAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case candidateId
+        case id
+        case label
+        case role
+        case source
+        case bounds
+        case snapshotRef
+        case snapshotAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        candidateId = try container.decodeIfPresent(String.self, forKey: .candidateId) ??
+            container.decodeIfPresent(String.self, forKey: .id)
+        label = try container.decodeIfPresent(String.self, forKey: .label)
+        role = try container.decodeIfPresent(String.self, forKey: .role)
+        source = try container.decode(String.self, forKey: .source)
+        bounds = try container.decodeIfPresent(SnapshotBounds.self, forKey: .bounds)
+        snapshotRef = try container.decode(String.self, forKey: .snapshotRef)
+        snapshotAt = try container.decode(String.self, forKey: .snapshotAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(candidateId, forKey: .candidateId)
+        try container.encodeIfPresent(label, forKey: .label)
+        try container.encodeIfPresent(role, forKey: .role)
+        try container.encode(source, forKey: .source)
+        try container.encodeIfPresent(bounds, forKey: .bounds)
+        try container.encode(snapshotRef, forKey: .snapshotRef)
+        try container.encode(snapshotAt, forKey: .snapshotAt)
+    }
+}
+
 struct SnapshotCandidate: Codable {
     let id: String
     let role: String
@@ -101,6 +145,7 @@ struct ActionRequest {
     let text: String?
     let args: [String: String]
     let rawArgs: Any
+    let targetDescriptor: TargetDescriptor?
 
     init(params: [String: String]?) {
         self.actionKind = params?["actionKind"] ?? ""
@@ -114,9 +159,11 @@ struct ActionRequest {
             self.approvalToken = nil
         }
 
+        var parsedArgs: Any = [String: Any]()
         if let argsJson = params?["argsJson"],
            let data = argsJson.data(using: .utf8),
            let parsed = try? JSONSerialization.jsonObject(with: data) {
+            parsedArgs = parsed
             self.rawArgs = parsed
             var normalized: [String: String] = [:]
             if let dictionary = parsed as? [String: Any] {
@@ -132,6 +179,20 @@ struct ActionRequest {
         } else {
             self.rawArgs = [String: Any]()
             self.args = [:]
+        }
+
+        if let descriptorJson = params?["targetDescriptorJson"],
+           let data = descriptorJson.data(using: .utf8),
+           let descriptor = try? JSONDecoder().decode(TargetDescriptor.self, from: data) {
+            self.targetDescriptor = descriptor
+        } else if let dictionary = parsedArgs as? [String: Any],
+                  let descriptorObject = dictionary["targetDescriptor"],
+                  JSONSerialization.isValidJSONObject(descriptorObject),
+                  let data = try? JSONSerialization.data(withJSONObject: descriptorObject),
+                  let descriptor = try? JSONDecoder().decode(TargetDescriptor.self, from: data) {
+            self.targetDescriptor = descriptor
+        } else {
+            self.targetDescriptor = nil
         }
     }
 }

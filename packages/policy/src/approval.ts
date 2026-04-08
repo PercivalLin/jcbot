@@ -21,7 +21,14 @@ export function createApprovalToken(input: {
 
 export function hashApprovalAction(action: DesktopAction): string {
   return createHash("sha256")
-    .update(serializeApprovalValue({ kind: action.kind, target: action.target, args: action.args ?? {} }))
+    .update(
+      serializeApprovalValue({
+        kind: action.kind,
+        target: action.target,
+        args: action.args ?? {},
+        targetDescriptor: action.targetDescriptor
+      })
+    )
     .digest("hex");
 }
 

@@ -56,6 +56,7 @@ final class BridgeService {
     private var recentAccessibilityEvents: [SnapshotEvent] = []
     private let maxRecentAccessibilityEvents = 18
     private var workspaceObserver: NSObjectProtocol?
+    private var latestSnapshotProvenance: SnapshotProvenance?
 
     init() {
         workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -180,7 +181,7 @@ final class BridgeService {
             screenshotPath: screenshot?.path
         )
 
-        return SnapshotResult(
+        let snapshotResult = SnapshotResult(
             screenshotRef: screenshot?.ref ?? "bridge://snapshot/\(snapshotAt)",
             activeApp: activeApp,
             activeWindowTitle: activeWindowTitle,
@@ -196,6 +197,12 @@ final class BridgeService {
             recentEvents: currentObservationEvents(),
             candidates: candidates
         )
+
+        latestSnapshotProvenance = SnapshotProvenance(
+            screenshotRef: snapshotResult.screenshotRef,
+            snapshotAt: snapshotResult.snapshotAt
+        )
+        return snapshotResult
     }
 
     private func visibleWindows(limit: Int = 12) -> [WindowDescriptor] {
@@ -350,7 +357,7 @@ final class BridgeService {
             }
             let targetRole = resolveTargetRole(action)
 
-            try focusTarget(matching: label, preferredRole: targetRole)
+            try focusTarget(matching: label, preferredRole: targetRole, descriptor: action.targetDescriptor)
             return PerformActionResult(status: "focused-target:\(label)")
         case "ui.type_into_target":
             guard let label = resolveTargetLabel(action) else {
@@ -363,7 +370,7 @@ final class BridgeService {
                 return PerformActionResult(status: "noop:no-text")
             }
 
-            try typeIntoTarget(label: label, text: text, preferredRole: targetRole)
+            try typeIntoTarget(label: label, text: text, preferredRole: targetRole, descriptor: action.targetDescriptor)
             return PerformActionResult(status: "typed-into-target:\(label):\(text.count)")
         case "external.select_contact":
             return try selectContact(action)
@@ -388,7 +395,7 @@ final class BridgeService {
             }
             let targetRole = resolveTargetRole(action)
 
-            try clickTarget(matching: label, preferredRole: targetRole)
+            try clickTarget(matching: label, preferredRole: targetRole, descriptor: action.targetDescriptor)
             return PerformActionResult(status: "clicked-target:\(label)")
         case "ui.double_click", "double_click":
             if let point = resolvePointIfPresent(action) {
@@ -401,7 +408,7 @@ final class BridgeService {
             }
             let targetRole = resolveTargetRole(action)
 
-            try clickTarget(matching: label, preferredRole: targetRole, clickCount: 2)
+            try clickTarget(matching: label, preferredRole: targetRole, descriptor: action.targetDescriptor, clickCount: 2)
             return PerformActionResult(status: "double-clicked-target:\(label)")
         case "ui.click_target":
             guard let label = resolveTargetLabel(action) else {
@@ -409,7 +416,7 @@ final class BridgeService {
             }
             let targetRole = resolveTargetRole(action)
 
-            try clickTarget(matching: label, preferredRole: targetRole)
+            try clickTarget(matching: label, preferredRole: targetRole, descriptor: action.targetDescriptor)
             return PerformActionResult(status: "clicked-target:\(label)")
         case "ui.scroll", "scroll":
             let scroll = resolveScrollVector(action)
@@ -1271,40 +1278,114 @@ final class BridgeService {
         }
     }
 
-    private func clickTarget(matching label: String, preferredRole: String? = nil, clickCount: Int = 1) throws {
-        guard AXIsProcessTrusted() else {
-            throw BridgeRuntimeError(code: -32035, message: "Accessibility permission is required for target-based clicking.")
+    private func clickTarget(
+        matching label: String,
+        preferredRole: String? = nil,
+        descriptor: TargetDescriptor? = nil,
+        clickCount: Int = 1
+    ) throws {
+        if AXIsProcessTrusted() {
+            do {
+                let match = try resolveTargetElement(matching: label, preferredRole: preferredRole)
+
+                if AXUIElementPerformAction(match.element, kAXPressAction as CFString) == .success {
+                    return
+                }
+
+                if let bounds = match.candidate.bounds {
+                    let center = CGPoint(x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2)
+                    try click(at: center, clickCount: clickCount)
+                    return
+                }
+
+                throw BridgeRuntimeError(code: -32037, message: "Matched target '\(label)' but could not perform a press action.")
+            } catch let error as BridgeRuntimeError {
+                if let bounds = validatedBoundsFallback(for: descriptor, targetLabel: label) {
+                    let center = CGPoint(x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2)
+                    try click(at: center, clickCount: clickCount)
+                    return
+                }
+
+                throw error
+            }
         }
 
-        let match = try resolveTargetElement(matching: label, preferredRole: preferredRole)
-
-        if AXUIElementPerformAction(match.element, kAXPressAction as CFString) == .success {
-            return
-        }
-
-        if let bounds = match.candidate.bounds {
+        if let bounds = validatedBoundsFallback(for: descriptor, targetLabel: label) {
             let center = CGPoint(x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2)
             try click(at: center, clickCount: clickCount)
             return
         }
 
-        throw BridgeRuntimeError(code: -32037, message: "Matched target '\(label)' but could not perform a press action.")
+        throw BridgeRuntimeError(code: -32035, message: "Accessibility permission is required for target-based clicking.")
     }
 
-    private func focusTarget(matching label: String, preferredRole: String? = nil) throws {
-        let match = try resolveTargetElement(matching: label, preferredRole: preferredRole)
-        try focus(element: match.element, preferredLabel: label, fallbackBounds: match.candidate.bounds)
-    }
+    private func focusTarget(
+        matching label: String,
+        preferredRole: String? = nil,
+        descriptor: TargetDescriptor? = nil
+    ) throws {
+        if AXIsProcessTrusted() {
+            do {
+                let match = try resolveTargetElement(matching: label, preferredRole: preferredRole)
+                try focus(element: match.element, preferredLabel: label, fallbackBounds: match.candidate.bounds)
+                return
+            } catch let error as BridgeRuntimeError {
+                if let bounds = validatedBoundsFallback(for: descriptor, targetLabel: label) {
+                    let center = CGPoint(x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2)
+                    try click(at: center)
+                    return
+                }
 
-    private func typeIntoTarget(label: String, text: String, preferredRole: String? = nil) throws {
-        let match = try resolveTargetElement(matching: label, preferredRole: preferredRole)
-        try focus(element: match.element, preferredLabel: label, fallbackBounds: match.candidate.bounds)
+                throw error
+            }
+        }
 
-        if setValue(text, on: match.element) {
+        if let bounds = validatedBoundsFallback(for: descriptor, targetLabel: label) {
+            let center = CGPoint(x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2)
+            try click(at: center)
             return
         }
 
-        try typeText(text)
+        throw BridgeRuntimeError(code: -32035, message: "Accessibility permission is required for target-based focus actions.")
+    }
+
+    private func typeIntoTarget(
+        label: String,
+        text: String,
+        preferredRole: String? = nil,
+        descriptor: TargetDescriptor? = nil
+    ) throws {
+        if AXIsProcessTrusted() {
+            do {
+                let match = try resolveTargetElement(matching: label, preferredRole: preferredRole)
+                try focus(element: match.element, preferredLabel: label, fallbackBounds: match.candidate.bounds)
+
+                if setValue(text, on: match.element) {
+                    return
+                }
+
+                try typeText(text)
+                return
+            } catch let error as BridgeRuntimeError {
+                if let bounds = validatedBoundsFallback(for: descriptor, targetLabel: label) {
+                    let center = CGPoint(x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2)
+                    try click(at: center)
+                    try typeText(text)
+                    return
+                }
+
+                throw error
+            }
+        }
+
+        if let bounds = validatedBoundsFallback(for: descriptor, targetLabel: label) {
+            let center = CGPoint(x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2)
+            try click(at: center)
+            try typeText(text)
+            return
+        }
+
+        throw BridgeRuntimeError(code: -32035, message: "Accessibility permission is required for target-based typing.")
     }
 
     private func accessibilityCandidates(limit: Int = 24, maxDepth: Int = 4) -> [ResolvedAccessibilityElement] {
@@ -1760,6 +1841,39 @@ final class BridgeService {
         return match
     }
 
+    func validatedBoundsFallback(for descriptor: TargetDescriptor?, targetLabel: String) -> SnapshotBounds? {
+        guard let descriptor else {
+            return nil
+        }
+
+        let normalizedSource = descriptor.source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard normalizedSource == "ocr" || normalizedSource == "vision" else {
+            return nil
+        }
+
+        guard let latestSnapshotProvenance,
+              latestSnapshotProvenance.screenshotRef == descriptor.snapshotRef,
+              latestSnapshotProvenance.snapshotAt == descriptor.snapshotAt else {
+            return nil
+        }
+
+        guard labelMatchesDescriptor(targetLabel, descriptorLabel: descriptor.label) else {
+            return nil
+        }
+
+        guard let bounds = descriptor.bounds,
+              bounds.width.isFinite,
+              bounds.height.isFinite,
+              bounds.x.isFinite,
+              bounds.y.isFinite,
+              bounds.width > 0,
+              bounds.height > 0 else {
+            return nil
+        }
+
+        return bounds
+    }
+
     private func focus(element: AXUIElement, preferredLabel: String, fallbackBounds: SnapshotBounds?) throws {
         if isAttributeSettable(kAXFocusedAttribute as CFString, on: element),
            AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success {
@@ -1807,6 +1921,19 @@ final class BridgeService {
             .replacingOccurrences(of: "  ", with: " ")
     }
 
+    private func labelMatchesDescriptor(_ targetLabel: String, descriptorLabel: String?) -> Bool {
+        guard let descriptorLabel = descriptorLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+              descriptorLabel.isEmpty == false else {
+            return true
+        }
+
+        let normalizedTarget = normalize(targetLabel)
+        let normalizedDescriptor = normalize(descriptorLabel)
+        return normalizedTarget == normalizedDescriptor ||
+            normalizedTarget.contains(normalizedDescriptor) ||
+            normalizedDescriptor.contains(normalizedTarget)
+    }
+
     private func roleMatches(candidateRole: String, preferredRole: String) -> Bool {
         candidateRole == preferredRole ||
             candidateRole.contains(preferredRole) ||
@@ -1824,6 +1951,11 @@ private struct BridgeRuntimeError: LocalizedError {
 }
 
 private struct EmptyRpcResult: Codable {}
+
+private struct SnapshotProvenance {
+    let screenshotRef: String
+    let snapshotAt: String
+}
 
 private struct ResolvedAccessibilityElement {
     let element: AXUIElement

@@ -34,7 +34,14 @@ export function flattenRules(pack: ConstitutionPack): ConstitutionRule[] {
 
 export function fingerprintAction(action: DesktopAction): string {
   return createHash("sha256")
-    .update(JSON.stringify({ kind: action.kind, target: action.target, args: action.args }))
+    .update(
+      JSON.stringify({
+        kind: action.kind,
+        target: action.target,
+        args: action.args,
+        targetDescriptor: action.targetDescriptor
+      })
+    )
     .digest("hex");
 }
 

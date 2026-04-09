@@ -53,6 +53,7 @@ export type AdminObservationEvent = {
   kind: string;
   message: string;
   createdAt: string;
+  sequence?: number;
 };
 
 export type AdminRun = {
@@ -82,6 +83,7 @@ export type AdminRun = {
     }>;
   };
   latestObservation?: {
+    observationId?: string;
     activeApp?: string;
     activeWindowTitle?: string;
     candidatePreview?: AdminObservationElement[];

@@ -55,6 +55,7 @@ final class BridgeService {
     private var accessibilityObserver: AXObserver?
     private var recentAccessibilityEvents: [SnapshotEvent] = []
     private let maxRecentAccessibilityEvents = 18
+    private var nextObservationEventSequence = 0
     private var workspaceObserver: NSObjectProtocol?
     private var latestSnapshotProvenance: SnapshotProvenance?
 
@@ -152,7 +153,7 @@ final class BridgeService {
             eventTap: true,
             ocr: screenCapture,
             policyHardGate: true,
-            protocolVersion: 2,
+            protocolVersion: 3,
             supportedActions: supportedActions(),
             observationModes: supportedObservationModes(accessibility: accessibility, screenCapture: screenCapture)
         )
@@ -163,6 +164,7 @@ final class BridgeService {
         pumpAccessibilityObserverRunLoop()
         let formatter = ISO8601DateFormatter()
         let capturedAt = Date()
+        let observationId = "bridge://observation/\(UUID().uuidString)"
         let snapshotAt = formatter.string(from: capturedAt)
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? "Unknown"
         let windows = visibleWindows()
@@ -182,6 +184,7 @@ final class BridgeService {
         )
 
         let snapshotResult = SnapshotResult(
+            observationId: observationId,
             screenshotRef: screenshot?.ref ?? "bridge://snapshot/\(snapshotAt)",
             activeApp: activeApp,
             activeWindowTitle: activeWindowTitle,
@@ -199,6 +202,7 @@ final class BridgeService {
         )
 
         latestSnapshotProvenance = SnapshotProvenance(
+            observationId: snapshotResult.observationId,
             screenshotRef: snapshotResult.screenshotRef,
             snapshotAt: snapshotResult.snapshotAt
         )
@@ -290,7 +294,8 @@ final class BridgeService {
                 id: UUID().uuidString,
                 kind: normalizeAccessibilityNotification(notification),
                 message: message,
-                createdAt: formatter.string(from: Date())
+                createdAt: formatter.string(from: Date()),
+                sequence: nextSnapshotEventSequence()
             )
         )
 
@@ -305,7 +310,8 @@ final class BridgeService {
                 id: UUID().uuidString,
                 kind: kind,
                 message: message,
-                createdAt: ISO8601DateFormatter().string(from: Date())
+                createdAt: ISO8601DateFormatter().string(from: Date()),
+                sequence: nextSnapshotEventSequence()
             )
         )
 
@@ -331,6 +337,11 @@ final class BridgeService {
         default:
             return notification
         }
+    }
+
+    private func nextSnapshotEventSequence() -> Int {
+        nextObservationEventSequence += 1
+        return nextObservationEventSequence
     }
 
     private func performAction(_ action: ActionRequest) throws -> PerformActionResult {
@@ -1852,7 +1863,8 @@ final class BridgeService {
         }
 
         guard let latestSnapshotProvenance,
-              latestSnapshotProvenance.screenshotRef == descriptor.snapshotRef,
+              latestSnapshotProvenance.observationId == descriptor.observationId,
+              latestSnapshotProvenance.screenshotRef == descriptor.screenshotRef,
               latestSnapshotProvenance.snapshotAt == descriptor.snapshotAt else {
             return nil
         }
@@ -1953,6 +1965,7 @@ private struct BridgeRuntimeError: LocalizedError {
 private struct EmptyRpcResult: Codable {}
 
 private struct SnapshotProvenance {
+    let observationId: String
     let screenshotRef: String
     let snapshotAt: String
 }

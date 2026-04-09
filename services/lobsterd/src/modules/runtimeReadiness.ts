@@ -291,6 +291,22 @@ function checkChatPlugins(plugins: ChatPluginInstance[]): RuntimeReadinessCheck 
 
 function checkBridgeCapabilities(capabilities: BridgeCapabilities): RuntimeReadinessCheck[] {
   const checks: RuntimeReadinessCheck[] = [];
+  const protocolVersion = capabilities.protocolVersion ?? 0;
+
+  checks.push(
+    protocolVersion >= 3
+      ? {
+          id: "bridge.protocolVersion",
+          level: "ok",
+          message: `Bridge protocol version ${protocolVersion} is canonical.`
+        }
+      : {
+          id: "bridge.protocolVersion",
+          level: "fail",
+          message: `Bridge protocol version ${protocolVersion || "unknown"} is too old.`,
+          suggestion: "Upgrade or rebuild lobster-bridge to protocol version 3 or newer."
+        }
+  );
 
   checks.push(
     capabilities.policyHardGate

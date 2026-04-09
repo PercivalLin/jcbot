@@ -29,24 +29,34 @@ export type BridgeActionResult = {
   status: string;
 };
 
+export type BridgeActionContext = {
+  approvalToken?: ApprovalToken;
+  runId: string;
+};
+
 export interface BridgeClient {
   configureKnownApplications(applications: string[]): Promise<void>;
   describeCapabilities(): Promise<BridgeCapabilities>;
   searchApplications(query: string): Promise<string[]>;
-  performAction(action: DesktopAction, approvalToken?: ApprovalToken): Promise<BridgeActionResult>;
+  performAction(action: DesktopAction, context: BridgeActionContext): Promise<BridgeActionResult>;
   restart?(options?: { args?: string[]; command?: string }): Promise<void>;
   snapshot(): Promise<DesktopObservation>;
-  validateAction(action: DesktopAction, approvalToken?: ApprovalToken): Promise<{ allowed: boolean; reason: string }>;
+  validateAction(action: DesktopAction, context: BridgeActionContext): Promise<{ allowed: boolean; reason: string }>;
 }
 
 export class StubBridgeClient implements BridgeClient {
   private knownApplications = getKnownApplications();
+  private observationSequence = 0;
+  private recentEventSequence = 0;
   private state: DesktopObservation = {
+    observationId: "stub://observation/initial",
     screenshotRef: "stub://snapshot/latest",
+    snapshotAt: new Date("2026-01-01T00:00:00.000Z").toISOString(),
     activeApp: "Lobster Stub Desktop",
     activeWindowTitle: "Discovery Workspace",
     ocrText: ["Stub desktop snapshot"],
     windows: ["Discovery Workspace"],
+    recentEvents: [],
     candidates: [
       {
         id: "candidate-open-finder",
@@ -78,7 +88,7 @@ export class StubBridgeClient implements BridgeClient {
       ocr: true,
       observationModes: ["stub"],
       policyHardGate: true,
-      protocolVersion: 2,
+      protocolVersion: 3,
       screenCapture: true
     };
   }
@@ -101,8 +111,8 @@ export class StubBridgeClient implements BridgeClient {
     return scored.slice(0, 8);
   }
 
-  async performAction(action: DesktopAction, approvalToken?: ApprovalToken): Promise<BridgeActionResult> {
-    const validation = await this.validateAction(action, approvalToken);
+  async performAction(action: DesktopAction, context: BridgeActionContext): Promise<BridgeActionResult> {
+    const validation = await this.validateAction(action, context);
     if (!validation.allowed) {
       throw new Error(validation.reason);
     }
@@ -114,6 +124,7 @@ export class StubBridgeClient implements BridgeClient {
         this.state.activeApp = applicationName;
         this.state.activeWindowTitle = `${applicationName} Window`;
         this.state.windows = Array.from(new Set([`${applicationName} Window`, ...this.state.windows]));
+        this.recordEvent("window.changed", `${action.kind}:${applicationName}`);
         return {
           status: `${action.kind === "ui.open_app" ? "opened" : "activated"}:${applicationName}`
         };
@@ -126,6 +137,7 @@ export class StubBridgeClient implements BridgeClient {
         }
 
         this.focusCandidate(label);
+        this.recordEvent("focus.changed", `${action.kind}:${label}`);
         return { status: `${action.kind === "ui.focus_target" ? "focused" : "clicked"}-target:${label}` };
       }
       case "ui.type_into_target": {
@@ -137,6 +149,7 @@ export class StubBridgeClient implements BridgeClient {
 
         const candidate = this.focusCandidate(label, "text field");
         candidate.value = text;
+        this.recordEvent("value.changed", `${label}:${text.length}`);
         return { status: `typed-into-target:${label}:${text.length}` };
       }
       case "external.select_contact": {
@@ -163,6 +176,7 @@ export class StubBridgeClient implements BridgeClient {
         contactCandidate.focused = true;
         this.state.activeWindowTitle = `${contact} Chat`;
         this.state.windows = Array.from(new Set([`${contact} Chat`, ...this.state.windows]));
+        this.recordEvent("selection.changed", `selected-contact:${contact}`);
         return { status: `selected-contact:${contact}` };
       }
       case "external.upload_file": {
@@ -177,6 +191,7 @@ export class StubBridgeClient implements BridgeClient {
         const fileName = path.split(/[\\/]/).at(-1) ?? path;
         this.state.activeWindowTitle = `${fileName} Selected`;
         this.state.windows = Array.from(new Set([`${fileName} Selected`, ...this.state.windows]));
+        this.recordEvent("window.changed", `uploaded-file:${fileName}`);
         return { status: `uploaded-file:${fileName}` };
       }
       case "ui.type_text":
@@ -190,6 +205,7 @@ export class StubBridgeClient implements BridgeClient {
           this.state.candidates.find((entry) => entry.focused) ?? this.focusCandidate(action.target ?? "Current Focus", "text field");
         candidate.value = text;
         candidate.focused = true;
+        this.recordEvent("value.changed", `${action.kind}:${text.length}`);
         return { status: `typed:${text.length}` };
       }
       case "ui.edit_existing": {
@@ -200,6 +216,7 @@ export class StubBridgeClient implements BridgeClient {
           "edit";
         this.state.activeWindowTitle = `Edited ${instruction}`;
         this.state.windows = Array.from(new Set([`Edited ${instruction}`, ...this.state.windows]));
+        this.recordEvent("value.changed", `edited:${instruction}`);
         return { status: `edited:${instruction}` };
       }
       case "ui.hotkey": {
@@ -224,6 +241,7 @@ export class StubBridgeClient implements BridgeClient {
           this.state.activeWindowTitle = `Shortcut ${keys}`;
           this.state.windows = Array.from(new Set([`Shortcut ${keys}`, ...this.state.windows]));
         }
+        this.recordEvent("window.changed", `hotkey:${keys}`);
         return { status: `hotkey:${keys}` };
       }
       case "ui.scroll": {
@@ -235,6 +253,7 @@ export class StubBridgeClient implements BridgeClient {
           "320";
         this.state.activeWindowTitle = `Scrolled ${direction}`;
         this.state.windows = Array.from(new Set([`Scrolled ${direction}`, ...this.state.windows]));
+        this.recordEvent("selection.changed", `scroll:${direction}:${amount}`);
         return { status: `scrolled:${direction}:${amount}` };
       }
       default:
@@ -243,10 +262,17 @@ export class StubBridgeClient implements BridgeClient {
   }
 
   async snapshot(): Promise<DesktopObservation> {
+    this.observationSequence += 1;
+    this.state.observationId = `stub://observation/${this.observationSequence}`;
+    this.state.snapshotAt = new Date(Date.UTC(2026, 0, 1, 0, 0, this.observationSequence)).toISOString();
+    this.state.screenshotRef = `stub://snapshot/${this.observationSequence}`;
     return {
       ...this.state,
       windows: [...this.state.windows],
       ocrText: [...this.state.ocrText],
+      recentEvents: (this.state.recentEvents ?? []).map((event) => ({
+        ...event
+      })),
       candidates: this.state.candidates.map((candidate) => ({
         ...candidate,
         bounds: candidate.bounds ? { ...candidate.bounds } : undefined
@@ -254,7 +280,21 @@ export class StubBridgeClient implements BridgeClient {
     };
   }
 
-  async validateAction(action: DesktopAction, approvalToken?: ApprovalToken) {
+  async validateAction(action: DesktopAction, context: BridgeActionContext) {
+    if (!action.id.trim()) {
+      return {
+        allowed: false,
+        reason: `Stub bridge requires a canonical actionId for ${action.kind}.`
+      };
+    }
+
+    if (!context.runId.trim()) {
+      return {
+        allowed: false,
+        reason: `Stub bridge requires a canonical runId for ${action.kind}.`
+      };
+    }
+
     if (action.riskLevel === "red") {
       return {
         allowed: false,
@@ -262,14 +302,21 @@ export class StubBridgeClient implements BridgeClient {
       };
     }
 
-    if (action.riskLevel === "yellow" && !approvalToken) {
+    if (action.riskLevel === "yellow" && !context.approvalToken) {
       return {
         allowed: false,
         reason: `Stub bridge requires approval for ${action.kind}.`
       };
     }
 
-    if (action.riskLevel === "yellow" && approvalToken && !isApprovalTokenValid(approvalToken, action)) {
+    if (action.riskLevel === "yellow" && context.approvalToken && context.approvalToken.runId !== context.runId) {
+      return {
+        allowed: false,
+        reason: `Stub bridge rejected approval token with mismatched runId for ${action.kind}.`
+      };
+    }
+
+    if (action.riskLevel === "yellow" && context.approvalToken && !isApprovalTokenValid(context.approvalToken, action)) {
       return {
         allowed: false,
         reason: `Stub bridge rejected stale or mismatched approval token for ${action.kind}.`
@@ -283,6 +330,19 @@ export class StubBridgeClient implements BridgeClient {
   }
 
   async restart() {}
+
+  private recordEvent(kind: string, message: string) {
+    this.recentEventSequence += 1;
+    const event = {
+      id: `stub-event-${this.recentEventSequence}`,
+      kind,
+      message,
+      createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, this.recentEventSequence)).toISOString(),
+      sequence: this.recentEventSequence
+    };
+    const recentEvents = [...(this.state.recentEvents ?? []), event];
+    this.state.recentEvents = recentEvents.slice(-18);
+  }
 
   private resolveApplicationName(action: DesktopAction) {
     const directTarget =
@@ -439,10 +499,12 @@ export class ChildProcessBridgeClient implements BridgeClient {
     }, 10_000)) as string[];
   }
 
-  async performAction(action: DesktopAction, approvalToken?: ApprovalToken) {
+  async performAction(action: DesktopAction, context: BridgeActionContext) {
     return (await this.request("ui.performAction", {
+      actionId: action.id,
       actionKind: action.kind,
-      approvalTokenJson: approvalToken ? JSON.stringify(approvalToken) : "",
+      approvalTokenJson: context.approvalToken ? JSON.stringify(context.approvalToken) : "",
+      runId: context.runId,
       target: action.target ?? "",
       text: typeof action.args.text === "string" ? action.args.text : "",
       argsJson: JSON.stringify(action.args ?? {}),
@@ -454,6 +516,7 @@ export class ChildProcessBridgeClient implements BridgeClient {
     const result = (await this.request("observation.snapshot", undefined, 15_000)) as {
       activeApp?: string;
       activeWindowTitle?: string;
+      observationId?: string;
       candidates?: Array<{
         bounds?: {
           height: number;
@@ -492,6 +555,7 @@ export class ChildProcessBridgeClient implements BridgeClient {
         id?: string;
         kind?: string;
         message?: string;
+        sequence?: number;
       }>;
       screenshotRef?: string;
       screenshotPath?: string;
@@ -524,6 +588,7 @@ export class ChildProcessBridgeClient implements BridgeClient {
     });
 
     return {
+      observationId: result.observationId,
       screenshotRef: result.screenshotRef ?? "bridge://unknown",
       activeApp: result.activeApp ?? "Unknown",
       activeWindowTitle: result.activeWindowTitle ?? result.note,
@@ -537,17 +602,23 @@ export class ChildProcessBridgeClient implements BridgeClient {
           id: event.id ?? randomUUID(),
           kind: event.kind ?? "bridge.event",
           message: event.message ?? "",
-          createdAt: event.createdAt ?? new Date().toISOString()
+          createdAt: event.createdAt ?? new Date().toISOString(),
+          sequence:
+            typeof event.sequence === "number" && Number.isFinite(event.sequence)
+              ? Math.max(0, Math.trunc(event.sequence))
+              : 0
         })) ?? [],
       windows: result.windows ?? (result.note ? [result.note] : []),
       candidates: result.candidates?.map((candidate) => normalizeCandidate(candidate)) ?? []
     };
   }
 
-  async validateAction(action: DesktopAction, approvalToken?: ApprovalToken) {
+  async validateAction(action: DesktopAction, context: BridgeActionContext) {
     return (await this.request("policy.validateAction", {
+      actionId: action.id,
       actionKind: action.kind,
-      approvalTokenJson: approvalToken ? JSON.stringify(approvalToken) : "",
+      approvalTokenJson: context.approvalToken ? JSON.stringify(context.approvalToken) : "",
+      runId: context.runId,
       target: action.target ?? "",
       text: typeof action.args.text === "string" ? action.args.text : "",
       argsJson: JSON.stringify(action.args ?? {}),
@@ -758,16 +829,16 @@ class ManagedBridgeClient implements BridgeClient {
     return this.inner.searchApplications(query);
   }
 
-  async performAction(action: DesktopAction, approvalToken?: ApprovalToken) {
-    return this.inner.performAction(action, approvalToken);
+  async performAction(action: DesktopAction, context: BridgeActionContext) {
+    return this.inner.performAction(action, context);
   }
 
   async snapshot() {
     return this.inner.snapshot();
   }
 
-  async validateAction(action: DesktopAction, approvalToken?: ApprovalToken) {
-    return this.inner.validateAction(action, approvalToken);
+  async validateAction(action: DesktopAction, context: BridgeActionContext) {
+    return this.inner.validateAction(action, context);
   }
 
   async restart(options?: { args?: string[]; command?: string }) {

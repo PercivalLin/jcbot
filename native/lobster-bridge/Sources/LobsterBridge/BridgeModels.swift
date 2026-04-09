@@ -46,6 +46,7 @@ struct ApprovalPayload: Codable {
 }
 
 struct SnapshotResult: Codable {
+    let observationId: String
     let screenshotRef: String
     let activeApp: String
     let activeWindowTitle: String?
@@ -77,8 +78,9 @@ struct TargetDescriptor: Codable {
     let role: String?
     let source: String
     let bounds: SnapshotBounds?
-    let snapshotRef: String
-    let snapshotAt: String
+    let observationId: String?
+    let screenshotRef: String?
+    let snapshotAt: String?
 
     private enum CodingKeys: String, CodingKey {
         case candidateId
@@ -87,6 +89,8 @@ struct TargetDescriptor: Codable {
         case role
         case source
         case bounds
+        case observationId
+        case screenshotRef
         case snapshotRef
         case snapshotAt
     }
@@ -99,8 +103,10 @@ struct TargetDescriptor: Codable {
         role = try container.decodeIfPresent(String.self, forKey: .role)
         source = try container.decode(String.self, forKey: .source)
         bounds = try container.decodeIfPresent(SnapshotBounds.self, forKey: .bounds)
-        snapshotRef = try container.decode(String.self, forKey: .snapshotRef)
-        snapshotAt = try container.decode(String.self, forKey: .snapshotAt)
+        observationId = try container.decodeIfPresent(String.self, forKey: .observationId)
+        screenshotRef = try container.decodeIfPresent(String.self, forKey: .screenshotRef) ??
+            container.decodeIfPresent(String.self, forKey: .snapshotRef)
+        snapshotAt = try container.decodeIfPresent(String.self, forKey: .snapshotAt)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -110,8 +116,9 @@ struct TargetDescriptor: Codable {
         try container.encodeIfPresent(role, forKey: .role)
         try container.encode(source, forKey: .source)
         try container.encodeIfPresent(bounds, forKey: .bounds)
-        try container.encode(snapshotRef, forKey: .snapshotRef)
-        try container.encode(snapshotAt, forKey: .snapshotAt)
+        try container.encodeIfPresent(observationId, forKey: .observationId)
+        try container.encodeIfPresent(screenshotRef, forKey: .screenshotRef)
+        try container.encodeIfPresent(snapshotAt, forKey: .snapshotAt)
     }
 }
 
@@ -131,6 +138,7 @@ struct SnapshotEvent: Codable {
     let kind: String
     let message: String
     let createdAt: String
+    let sequence: Int
 }
 
 struct WindowDescriptor {
@@ -139,8 +147,10 @@ struct WindowDescriptor {
 }
 
 struct ActionRequest {
+    let actionId: String
     let actionKind: String
     let approvalToken: ApprovalPayload?
+    let runId: String
     let target: String?
     let text: String?
     let args: [String: String]
@@ -148,7 +158,9 @@ struct ActionRequest {
     let targetDescriptor: TargetDescriptor?
 
     init(params: [String: String]?) {
+        self.actionId = params?["actionId"] ?? ""
         self.actionKind = params?["actionKind"] ?? ""
+        self.runId = params?["runId"] ?? ""
         self.target = params?["target"]
         self.text = params?["text"]
 

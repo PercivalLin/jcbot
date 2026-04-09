@@ -1,5 +1,6 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { ApprovalToken, DesktopAction, RiskLevel } from "@lobster/shared";
+import { fingerprintCanonicalAction } from "./canonicalAction.js";
 
 export function createApprovalToken(input: {
   runId: string;
@@ -20,46 +21,9 @@ export function createApprovalToken(input: {
 }
 
 export function hashApprovalAction(action: DesktopAction): string {
-  return createHash("sha256")
-    .update(
-      serializeApprovalValue({
-        kind: action.kind,
-        target: action.target,
-        args: action.args ?? {},
-        targetDescriptor: action.targetDescriptor
-      })
-    )
-    .digest("hex");
+  return fingerprintCanonicalAction(action);
 }
 
 export function isApprovalTokenValid(token: ApprovalToken, action: DesktopAction, now = new Date()): boolean {
   return token.actionFingerprint === hashApprovalAction(action) && new Date(token.expiresAt) > now;
-}
-
-function serializeApprovalValue(value: unknown): string {
-  if (value === null) {
-    return "null";
-  }
-
-  if (value === undefined) {
-    return "";
-  }
-
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return JSON.stringify(value);
-  }
-
-  if (Array.isArray(value)) {
-    return `[${value.map((entry) => serializeApprovalValue(entry)).join(",")}]`;
-  }
-
-  if (typeof value === "object") {
-    const entries = Object.entries(value)
-      .filter(([, entryValue]) => entryValue !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, entryValue]) => `${JSON.stringify(key)}:${serializeApprovalValue(entryValue)}`);
-    return `{${entries.join(",")}}`;
-  }
-
-  return JSON.stringify(String(value));
 }

@@ -12,11 +12,11 @@ import type {
   TaskRun
 } from "@lobster/shared";
 import { jsonRpcRequestSchema } from "@lobster/shared";
-import { createApprovalToken } from "@lobster/policy";
+import { createApprovalToken, hasCanonicalTargetDescriptorProvenance } from "@lobster/policy";
 import type { RuntimePersistence } from "@lobster/storage";
 import { InboxEngine } from "../modules/inboxEngine.js";
 import type { NotificationSignal } from "../modules/inboxEngine.js";
-import type { BridgeClient } from "../modules/bridgeClient.js";
+import type { BridgeCapabilities, BridgeClient } from "../modules/bridgeClient.js";
 import { ModelRouter } from "../modules/modelRouter.js";
 import { SkillRegistry } from "../modules/skillRegistry.js";
 import { TaskOrchestrator } from "../modules/taskOrchestrator.js";
@@ -48,6 +48,7 @@ const IN_FLIGHT_RUN_STATUSES = new Set<TaskRun["status"]>([
   "executing",
   "verifying"
 ]);
+const MINIMUM_BRIDGE_PROTOCOL_VERSION = 3;
 
 export function consumeNewlineDelimitedChunk(buffer: string, chunk: Buffer | string) {
   const nextBuffer = buffer + (typeof chunk === "string" ? chunk : chunk.toString("utf8"));
@@ -132,6 +133,7 @@ export class RpcServer {
 
   async createTask(request: TaskRequest) {
     return this.runDesktopWork(async () => {
+      await this.assertCanonicalBridgeProtocol();
       const existingRunId = this.state.runsByRequestKey.get(this.requestKey(request));
       if (existingRunId) {
         const existingRun = this.state.runs.get(existingRunId) ?? (await this.persistence.getRun(existingRunId));
@@ -153,6 +155,7 @@ export class RpcServer {
 
   async approveTicket(ticketId: string, approvedBy: string) {
     return this.runDesktopWork(async () => {
+      await this.assertCanonicalBridgeProtocol();
       const ticket = this.state.approvals.get(ticketId) ?? (await this.persistence.getApproval(ticketId));
       if (!ticket) {
         throw new Error(`Approval ticket ${ticketId} not found.`);
@@ -165,6 +168,38 @@ export class RpcServer {
 
       this.assertPendingTicket(ticket);
       this.assertRunAwaitingApproval(run, ticket.id);
+      const unsafeApprovalMessage = this.unsafeApprovalResumeMessage(run, ticket);
+      if (unsafeApprovalMessage) {
+        const expiredTicket: ApprovalTicket = {
+          ...ticket,
+          state: "expired"
+        };
+        const blockedRun: TaskRun = {
+          ...run,
+          status: "blocked",
+          outcomeSummary: unsafeApprovalMessage,
+          updatedAt: new Date().toISOString()
+        };
+        this.state.approvals.set(expiredTicket.id, expiredTicket);
+        await this.persistence.saveApproval(expiredTicket);
+        await this.recordRunEvent(
+          {
+            eventId: randomUUID(),
+            runId: blockedRun.runId,
+            kind: "approval.resolved",
+            status: blockedRun.status,
+            message: unsafeApprovalMessage,
+            createdAt: blockedRun.updatedAt
+          },
+          blockedRun
+        );
+        await this.safeNotify(() => this.notifier.notifyRunSettled(run.request, blockedRun));
+        return {
+          token: undefined,
+          run: blockedRun,
+          approvalTicket: undefined
+        };
+      }
 
       const token = createApprovalToken({
         runId: ticket.runId,
@@ -396,6 +431,15 @@ export class RpcServer {
     this.safeNotify(() => this.notifier.notifyRunEvent(run.request, run, event));
   }
 
+  private async assertCanonicalBridgeProtocol() {
+    const capabilities = await this.bridgeClient.describeCapabilities();
+    if ((capabilities.protocolVersion ?? 0) < MINIMUM_BRIDGE_PROTOCOL_VERSION) {
+      throw new Error(
+        `Bridge protocol version ${capabilities.protocolVersion ?? "unknown"} is too old; lobsterd requires protocol version ${MINIMUM_BRIDGE_PROTOCOL_VERSION} or newer.`
+      );
+    }
+  }
+
   private async runDesktopWork<T>(work: () => Promise<T>) {
     const previous = this.desktopQueue;
     let release = () => {};
@@ -436,6 +480,7 @@ export class RpcServer {
   private async reconcileRecoveredState() {
     const recoveredAt = new Date().toISOString();
     const pendingApprovalRunIds = new Set<string>();
+    const unsafeApprovalRunIds = new Set<string>();
 
     for (const approval of [...this.state.approvals.values()]) {
       if (approval.state !== "pending") {
@@ -443,6 +488,10 @@ export class RpcServer {
       }
 
       pendingApprovalRunIds.add(approval.runId);
+      const run = this.state.runs.get(approval.runId);
+      if (run && this.unsafeApprovalResumeMessage(run, approval)) {
+        unsafeApprovalRunIds.add(run.runId);
+      }
       const expiredTicket: ApprovalTicket = {
         ...approval,
         state: "expired"
@@ -456,7 +505,12 @@ export class RpcServer {
         continue;
       }
 
-      const reconciledRun = this.reconcileRecoveredRun(run, recoveredAt, pendingApprovalRunIds.has(run.runId));
+      const reconciledRun = this.reconcileRecoveredRun(
+        run,
+        recoveredAt,
+        pendingApprovalRunIds.has(run.runId),
+        unsafeApprovalRunIds.has(run.runId)
+      );
       this.state.runs.set(reconciledRun.runId, reconciledRun);
       this.state.runsByRequestKey.set(this.requestKey(reconciledRun.request), reconciledRun.runId);
       await this.persistence.saveRun(reconciledRun);
@@ -477,13 +531,20 @@ export class RpcServer {
     }
   }
 
-  private reconcileRecoveredRun(run: TaskRun, recoveredAt: string, hadPendingApproval: boolean): TaskRun {
+  private reconcileRecoveredRun(
+    run: TaskRun,
+    recoveredAt: string,
+    hadPendingApproval: boolean,
+    hadUnsafePendingApproval: boolean
+  ): TaskRun {
     if (run.status === "awaiting_approval") {
       return {
         ...run,
         status: "blocked",
-        outcomeSummary: hadPendingApproval
-          ? "Daemon restarted while waiting for approval. The pending approval ticket was expired; review the desktop state and retry the task."
+        outcomeSummary: hadUnsafePendingApproval
+          ? "Daemon restarted while waiting for approval, but the pending action lacked canonical observation provenance. Re-observe the desktop, regenerate the target, and request a fresh approval ticket."
+          : hadPendingApproval
+            ? "Daemon restarted while waiting for approval. The pending approval ticket was expired; review the desktop state and retry the task."
           : "Daemon restarted while the task was waiting for approval. Review the desktop state and retry the task.",
         updatedAt: recoveredAt
       };
@@ -495,6 +556,23 @@ export class RpcServer {
       outcomeSummary: `Daemon restarted while the task was in progress (previous status: ${run.status}). Review the desktop state and retry the task.`,
       updatedAt: recoveredAt
     };
+  }
+
+  private unsafeApprovalResumeMessage(run: TaskRun, ticket: ApprovalTicket) {
+    const currentAction = this.resolveCurrentRunAction(run) ?? ticket.action;
+    const descriptor = currentAction.targetDescriptor;
+    if (descriptor && !hasCanonicalTargetDescriptorProvenance(descriptor)) {
+      return "Pending approval expired because the current action lacks canonical observation provenance. Re-observe the desktop, regenerate the action target, and request a fresh approval ticket.";
+    }
+    return undefined;
+  }
+
+  private resolveCurrentRunAction(run: TaskRun) {
+    if (!run.currentStepId) {
+      return undefined;
+    }
+
+    return run.plan.find((step) => step.id === run.currentStepId)?.action;
   }
 
   private async handleLine(line: string): Promise<JsonRpcResponse> {

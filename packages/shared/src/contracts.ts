@@ -71,6 +71,7 @@ export const targetDescriptorSchema = z.object({
   role: z.string().optional(),
   source: uiCandidateSchema.shape.source,
   bounds: uiCandidateSchema.shape.bounds.optional(),
+  observationId: z.string().optional(),
   screenshotRef: z.string().optional(),
   snapshotAt: z.string().optional()
 });
@@ -80,11 +81,13 @@ export const desktopObservationEventSchema = z.object({
   id: z.string(),
   kind: z.string(),
   message: z.string(),
-  createdAt: z.string()
+  createdAt: z.string(),
+  sequence: z.number().int().nonnegative().default(0)
 });
 export type DesktopObservationEvent = z.infer<typeof desktopObservationEventSchema>;
 
 export const desktopObservationSchema = z.object({
+  observationId: z.string().optional(),
   screenshotRef: z.string(),
   activeApp: z.string(),
   activeWindowTitle: z.string().optional(),

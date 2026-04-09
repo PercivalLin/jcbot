@@ -18,7 +18,12 @@ import {
   type VerificationEvidenceItem,
   type VerificationResult
 } from "@lobster/shared";
-import { evaluateActionAgainstConstitution, flattenRules, loadConstitution } from "@lobster/policy";
+import {
+  evaluateActionAgainstConstitution,
+  flattenRules,
+  hasCanonicalTargetDescriptorProvenance,
+  loadConstitution
+} from "@lobster/policy";
 import { gateAction } from "@lobster/policy";
 import {
   getChatPluginApplications,
@@ -41,6 +46,13 @@ const CONSTITUTION_PATH = resolveWorkspaceConfigFile({
   importMetaUrl: import.meta.url,
   name: "constitution.yaml"
 });
+
+type ActionExecutionContext = {
+  actionId: string;
+  baselineEventSequence: number;
+  executedAt: string;
+  runId: string;
+};
 
 const OrchestratorState = Annotation.Root({
   run: Annotation<TaskRun>({
@@ -80,6 +92,10 @@ const OrchestratorState = Annotation.Root({
     default: () => undefined
   }),
   executionReport: Annotation<string | undefined>({
+    reducer: (_prev, next) => next,
+    default: () => undefined
+  }),
+  executionContext: Annotation<ActionExecutionContext | undefined>({
     reducer: (_prev, next) => next,
     default: () => undefined
   })
@@ -168,8 +184,9 @@ export class TaskOrchestrator {
       return { observation, run };
     })
     .addNode("planDraft", async (state) => {
-      const plan =
+      const sourcedPlan =
         state.run.plan.length > 0 ? state.run.plan : await this.createPlan(state.run.request, state.observation);
+      const plan = this.hydratePlanTargetDescriptors(sourcedPlan, state.observation);
       const currentStepId =
         state.run.currentStepId && plan.some((step) => step.id === state.run.currentStepId)
           ? state.run.currentStepId
@@ -231,7 +248,16 @@ export class TaskOrchestrator {
       }
 
       const action = this.resolveCurrentAction(state.run);
-      const bridgeDecision = await this.bridgeClient.validateAction(action, state.approvalToken);
+      const executionContext: ActionExecutionContext = {
+        actionId: action.id,
+        baselineEventSequence: this.latestObservationEventSequence(state.observation),
+        executedAt: new Date().toISOString(),
+        runId: state.run.runId
+      };
+      const bridgeDecision = await this.bridgeClient.validateAction(action, {
+        approvalToken: state.approvalToken,
+        runId: state.run.runId
+      });
       if (!bridgeDecision.allowed) {
         const status: TaskRun["status"] = action.riskLevel === "yellow" ? "awaiting_approval" : "blocked";
         return {
@@ -251,7 +277,10 @@ export class TaskOrchestrator {
         };
       }
 
-      const execution = await this.bridgeClient.performAction(action, state.approvalToken);
+      const execution = await this.bridgeClient.performAction(action, {
+        approvalToken: state.approvalToken,
+        runId: state.run.runId
+      });
       const run = {
         ...state.run,
         status: "verifying" as const,
@@ -260,7 +289,7 @@ export class TaskOrchestrator {
         updatedAt: new Date().toISOString()
       };
       await this.emitRunEvent(run, "run.status_changed", `Action dispatched: ${execution.status}`);
-      return { executionReport: execution.status, run };
+      return { executionContext, executionReport: execution.status, run };
     })
     .addNode("verify", async (state) => {
       if (!state.decision?.allowed) {
@@ -271,13 +300,15 @@ export class TaskOrchestrator {
       const settledObservation = await this.capturePostActionObservation(
         action,
         state.observation,
-        state.executionReport
+        state.executionReport,
+        state.executionContext
       );
       const verification = await this.refineVerificationWithVision(
         action,
         state.observation,
         settledObservation.observation,
-        settledObservation.verification
+        settledObservation.verification,
+        state.executionContext
       );
       const run = {
         ...state.run,
@@ -2530,7 +2561,8 @@ export class TaskOrchestrator {
     action: DesktopAction,
     before: DesktopObservation | undefined,
     after: DesktopObservation,
-    base: VerificationResult
+    base: VerificationResult,
+    executionContext: ActionExecutionContext | undefined
   ): Promise<VerificationResult> {
     if (base.status === "verified") {
       return base;
@@ -2553,7 +2585,7 @@ export class TaskOrchestrator {
             .slice(0, 12)
             .map((candidate) => this.serializeObservationElement(candidate))
             .filter(Boolean),
-          recentEventKinds: after.recentEvents?.map((event) => event.kind) ?? [],
+          recentEventKinds: this.listActionScopedObservationEvents(before, after, executionContext).map((event) => event.kind),
           textSummary:
             (typeof action.args.text === "string" && action.args.text.trim()) ||
             (typeof action.args.value === "string" && action.args.value.trim()) ||
@@ -2697,7 +2729,8 @@ export class TaskOrchestrator {
     action: DesktopAction,
     before: DesktopObservation | undefined,
     after: DesktopObservation,
-    executionReport?: string
+    executionReport?: string,
+    executionContext?: ActionExecutionContext
   ): VerificationResult {
     switch (action.kind) {
       case "ui.open_app":
@@ -2771,7 +2804,11 @@ export class TaskOrchestrator {
           ]);
         }
 
-        const focusEvent = this.findObservationEvent(after, ["focus.changed", "window.changed", "selection.changed"]);
+        const focusEvent = this.findActionObservationEvent(before, after, executionContext, [
+          "focus.changed",
+          "window.changed",
+          "selection.changed"
+        ]);
         if (focusEvent) {
           return this.verificationVerified(`Observed ${focusEvent.kind} after interacting with "${targetLabel}".`, [
             focusEvent.message
@@ -2805,7 +2842,7 @@ export class TaskOrchestrator {
           ]);
         }
 
-        const valueEvent = this.findObservationEvent(after, ["value.changed"]);
+        const valueEvent = this.findActionObservationEvent(before, after, executionContext, ["value.changed"]);
         if (valueEvent) {
           return this.verificationVerified(
             `Observed value change after typing into "${targetLabel}", although the exact text was not readable.`,
@@ -2836,7 +2873,7 @@ export class TaskOrchestrator {
           ]);
         }
 
-        const valueEvent = this.findObservationEvent(after, ["value.changed"]);
+        const valueEvent = this.findActionObservationEvent(before, after, executionContext, ["value.changed"]);
         if (valueEvent) {
           return this.verificationVerified(
             "Observed a value-change event after text input, although the exact text was not readable.",
@@ -2956,7 +2993,11 @@ export class TaskOrchestrator {
           );
         }
 
-        const hotkeyEvent = this.findObservationEvent(after, ["window.changed", "focus.changed", "selection.changed"]);
+        const hotkeyEvent = this.findActionObservationEvent(before, after, executionContext, [
+          "window.changed",
+          "focus.changed",
+          "selection.changed"
+        ]);
         if (hotkeyEvent) {
           return this.verificationVerified(
             keys ? `Hotkey "${keys}" dispatched and generated ${hotkeyEvent.kind}.` : `Hotkey dispatched and generated ${hotkeyEvent.kind}.`,
@@ -2981,7 +3022,11 @@ export class TaskOrchestrator {
           );
         }
 
-        const scrollEvent = this.findObservationEvent(after, ["value.changed", "selection.changed", "window.changed"]);
+        const scrollEvent = this.findActionObservationEvent(before, after, executionContext, [
+          "value.changed",
+          "selection.changed",
+          "window.changed"
+        ]);
         if (scrollEvent) {
           return this.verificationVerified(
             amount
@@ -3009,7 +3054,8 @@ export class TaskOrchestrator {
   private async capturePostActionObservation(
     action: DesktopAction,
     before: DesktopObservation | undefined,
-    executionReport?: string
+    executionReport?: string,
+    executionContext?: ActionExecutionContext
   ) {
     const policy = this.settlePolicyForAction(action);
     let latestObservation: DesktopObservation | undefined;
@@ -3021,7 +3067,7 @@ export class TaskOrchestrator {
       }
 
       const observation = await this.bridgeClient.snapshot();
-      const verification = this.verifyActionOutcome(action, before, observation, executionReport);
+      const verification = this.verifyActionOutcome(action, before, observation, executionReport, executionContext);
       latestObservation = observation;
       latestVerification = verification;
 
@@ -3106,6 +3152,10 @@ export class TaskOrchestrator {
 
   private isObservationFreshComparedTo(before: DesktopObservation | undefined, after: DesktopObservation) {
     if (!before) {
+      return true;
+    }
+
+    if (before.observationId && after.observationId && before.observationId !== after.observationId) {
       return true;
     }
 
@@ -3407,20 +3457,34 @@ export class TaskOrchestrator {
   }
 
   private hydrateActionTargetDescriptor(action: DesktopAction, observation: DesktopObservation) {
-    if (this.extractTargetDescriptor(action)) {
-      return action;
+    const existingDescriptor = this.extractTargetDescriptor(action);
+    if (existingDescriptor && hasCanonicalTargetDescriptorProvenance(existingDescriptor)) {
+      return {
+        ...action,
+        targetDescriptor: existingDescriptor
+      };
     }
 
     const label = this.resolveDescriptorLabel(action);
     if (!label) {
-      return action;
+      return existingDescriptor
+        ? {
+            ...action,
+            targetDescriptor: existingDescriptor
+          }
+        : action;
     }
 
     const preferredRole =
       action.kind === "external.select_contact" ? undefined : this.resolveActionRole(action);
     const candidate = this.findCandidateByLabel(observation, label, preferredRole);
     if (!candidate) {
-      return action;
+      return existingDescriptor
+        ? {
+            ...action,
+            targetDescriptor: existingDescriptor
+          }
+        : action;
     }
 
     const descriptor: TargetDescriptor = {
@@ -3429,6 +3493,7 @@ export class TaskOrchestrator {
       role: candidate.role,
       source: candidate.source,
       bounds: candidate.bounds,
+      observationId: observation.observationId,
       screenshotRef: observation.screenshotRef,
       snapshotAt: observation.snapshotAt
     };
@@ -3493,8 +3558,17 @@ export class TaskOrchestrator {
           : undefined,
       candidateId,
       label,
+      observationId:
+        "observationId" in raw && typeof raw.observationId === "string"
+          ? raw.observationId
+          : undefined,
       role: "role" in raw && typeof raw.role === "string" ? raw.role : undefined,
-      screenshotRef: "screenshotRef" in raw && typeof raw.screenshotRef === "string" ? raw.screenshotRef : undefined,
+      screenshotRef:
+        "screenshotRef" in raw && typeof raw.screenshotRef === "string"
+          ? raw.screenshotRef
+          : "snapshotRef" in raw && typeof raw.snapshotRef === "string"
+            ? raw.snapshotRef
+            : undefined,
       snapshotAt: "snapshotAt" in raw && typeof raw.snapshotAt === "string" ? raw.snapshotAt : undefined,
       source
     } satisfies TargetDescriptor;
@@ -3577,15 +3651,43 @@ export class TaskOrchestrator {
     });
   }
 
-  private findObservationEvent(observation: DesktopObservation | undefined, kinds: string[]) {
-    if (!observation) {
-      return undefined;
-    }
-
+  private findActionObservationEvent(
+    before: DesktopObservation | undefined,
+    after: DesktopObservation | undefined,
+    executionContext: ActionExecutionContext | undefined,
+    kinds: string[]
+  ) {
     const allowed = new Set(kinds.map((kind) => kind.toLowerCase()));
-    return [...(observation.recentEvents ?? [])]
+    return [...this.listActionScopedObservationEvents(before, after, executionContext)]
       .reverse()
       .find((event) => allowed.has(event.kind.toLowerCase()));
+  }
+
+  private listActionScopedObservationEvents(
+    before: DesktopObservation | undefined,
+    after: DesktopObservation | undefined,
+    executionContext: ActionExecutionContext | undefined
+  ) {
+    if (!after || !executionContext) {
+      return [];
+    }
+
+    if (!this.isObservationFreshComparedTo(before, after)) {
+      return [];
+    }
+
+    const executedAtMs = Date.parse(executionContext.executedAt);
+    return [...(after.recentEvents ?? [])]
+      .filter((event) => event.sequence > executionContext.baselineEventSequence)
+      .filter((event) => !Number.isFinite(executedAtMs) || Date.parse(event.createdAt) >= executedAtMs)
+      .sort((left, right) => left.sequence - right.sequence);
+  }
+
+  private latestObservationEventSequence(observation: DesktopObservation | undefined) {
+    return (observation?.recentEvents ?? []).reduce(
+      (maxSequence, event) => Math.max(maxSequence, event.sequence),
+      0
+    );
   }
 
   private serializeObservationElement(

@@ -2,10 +2,16 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import type { ApprovalToken, DesktopAction, DesktopObservation, TaskRequest } from "@lobster/shared";
+import type { ApprovalTicket, DesktopAction, DesktopObservation, TaskRequest, TaskRun } from "@lobster/shared";
 import { createRuntimePersistence } from "../../../../packages/storage/src/index.js";
 import { ModelRouter } from "../modules/modelRouter.js";
-import { StubBridgeClient, type BridgeActionResult, type BridgeCapabilities, type BridgeClient } from "../modules/bridgeClient.js";
+import {
+  StubBridgeClient,
+  type BridgeActionContext,
+  type BridgeActionResult,
+  type BridgeCapabilities,
+  type BridgeClient
+} from "../modules/bridgeClient.js";
 import type { ChatPluginInstance } from "../modules/chatPluginRegistry.js";
 import { NoopRuntimeNotifier } from "../modules/runtimeNotifier.js";
 import { consumeNewlineDelimitedChunk, RpcServer } from "./rpcServer.js";
@@ -83,6 +89,7 @@ class NonVerifyingBridgeClient implements BridgeClient {
       eventTap: true,
       ocr: false,
       policyHardGate: true,
+      protocolVersion: 3,
       screenCapture: true
     };
   }
@@ -91,7 +98,7 @@ class NonVerifyingBridgeClient implements BridgeClient {
     return [];
   }
 
-  async performAction(_action: DesktopAction, _approvalToken?: ApprovalToken): Promise<BridgeActionResult> {
+  async performAction(_action: DesktopAction, _context: BridgeActionContext): Promise<BridgeActionResult> {
     return {
       status: "performed"
     };
@@ -99,11 +106,14 @@ class NonVerifyingBridgeClient implements BridgeClient {
 
   async snapshot(): Promise<DesktopObservation> {
     return {
+      observationId: "stub://observation/failure",
       screenshotRef: "stub://snapshot/failure",
+      snapshotAt: "2026-01-01T00:00:01.000Z",
       activeApp: "Finder",
       activeWindowTitle: "Finder Window",
       ocrText: [],
       windows: ["Finder Window"],
+      recentEvents: [],
       candidates: [
         {
           id: "search-field",
@@ -118,7 +128,7 @@ class NonVerifyingBridgeClient implements BridgeClient {
     };
   }
 
-  async validateAction(_action: DesktopAction, _approvalToken?: ApprovalToken) {
+  async validateAction(_action: DesktopAction, _context: BridgeActionContext) {
     return {
       allowed: true,
       reason: "Allowed for verification test."
@@ -166,6 +176,7 @@ class OcrTypingBridgeClient extends NonVerifyingBridgeClient {
 class OcrOnlyTargetBridgeClient extends NonVerifyingBridgeClient {
   async snapshot(): Promise<DesktopObservation> {
     return {
+      observationId: "stub://observation/ocr-only",
       screenshotRef: "stub://snapshot/ocr-only",
       snapshotAt: "2026-01-01T00:00:05.000Z",
       activeApp: "Finder",
@@ -173,6 +184,7 @@ class OcrOnlyTargetBridgeClient extends NonVerifyingBridgeClient {
       observationMode: "hybrid",
       ocrText: ["Search"],
       windows: ["Finder Window"],
+      recentEvents: [],
       candidates: [
         {
           id: "ocr-search",
@@ -207,6 +219,7 @@ class RecoveringTypingBridgeClient implements BridgeClient {
       eventTap: true,
       ocr: false,
       policyHardGate: true,
+      protocolVersion: 3,
       screenCapture: true
     };
   }
@@ -215,7 +228,7 @@ class RecoveringTypingBridgeClient implements BridgeClient {
     return [];
   }
 
-  async performAction(_action: DesktopAction, _approvalToken?: ApprovalToken): Promise<BridgeActionResult> {
+  async performAction(_action: DesktopAction, _context: BridgeActionContext): Promise<BridgeActionResult> {
     this.actionAttempts += 1;
     return {
       status: "performed"
@@ -225,11 +238,14 @@ class RecoveringTypingBridgeClient implements BridgeClient {
   async snapshot(): Promise<DesktopObservation> {
     const typedValue = this.actionAttempts >= 2 ? "hello world" : "";
     return {
+      observationId: "stub://observation/recovering",
       screenshotRef: "stub://snapshot/recovering",
+      snapshotAt: "2026-01-01T00:00:02.000Z",
       activeApp: "Finder",
       activeWindowTitle: "Finder Window",
       ocrText: [],
       windows: ["Finder Window"],
+      recentEvents: [],
       candidates: [
         {
           id: "search-field",
@@ -244,7 +260,7 @@ class RecoveringTypingBridgeClient implements BridgeClient {
     };
   }
 
-  async validateAction(_action: DesktopAction, _approvalToken?: ApprovalToken) {
+  async validateAction(_action: DesktopAction, _context: BridgeActionContext) {
     return {
       allowed: true,
       reason: "Allowed for recovery test."
@@ -266,6 +282,7 @@ class SettlingTypingBridgeClient implements BridgeClient {
       eventTap: true,
       ocr: false,
       policyHardGate: true,
+      protocolVersion: 3,
       screenCapture: true
     };
   }
@@ -274,7 +291,7 @@ class SettlingTypingBridgeClient implements BridgeClient {
     return [];
   }
 
-  async performAction(_action: DesktopAction, _approvalToken?: ApprovalToken): Promise<BridgeActionResult> {
+  async performAction(_action: DesktopAction, _context: BridgeActionContext): Promise<BridgeActionResult> {
     this.actionAttempts += 1;
     return {
       status: "performed"
@@ -288,12 +305,14 @@ class SettlingTypingBridgeClient implements BridgeClient {
 
     const typedValue = this.postActionSnapshots >= 2 ? "hello world" : "";
     return {
+      observationId: `stub://observation/settling-${this.postActionSnapshots}`,
       screenshotRef: `stub://snapshot/settling-${this.postActionSnapshots}`,
       snapshotAt: `2026-01-01T00:00:0${Math.min(this.postActionSnapshots, 9)}.000Z`,
       activeApp: "Finder",
       activeWindowTitle: "Finder Window",
       ocrText: [],
       windows: ["Finder Window"],
+      recentEvents: [],
       candidates: [
         {
           id: "search-field",
@@ -308,7 +327,7 @@ class SettlingTypingBridgeClient implements BridgeClient {
     };
   }
 
-  async validateAction(_action: DesktopAction, _approvalToken?: ApprovalToken) {
+  async validateAction(_action: DesktopAction, _context: BridgeActionContext) {
     return {
       allowed: true,
       reason: "Allowed for settle-window test."
@@ -327,6 +346,7 @@ class LaunchAckOnlyBridgeClient implements BridgeClient {
       eventTap: true,
       ocr: false,
       policyHardGate: true,
+      protocolVersion: 3,
       screenCapture: true
     };
   }
@@ -335,7 +355,7 @@ class LaunchAckOnlyBridgeClient implements BridgeClient {
     return [];
   }
 
-  async performAction(action: DesktopAction, _approvalToken?: ApprovalToken): Promise<BridgeActionResult> {
+  async performAction(action: DesktopAction, _context: BridgeActionContext): Promise<BridgeActionResult> {
     if (action.kind === "ui.open_app") {
       return {
         status: "opened:Finder"
@@ -348,16 +368,19 @@ class LaunchAckOnlyBridgeClient implements BridgeClient {
 
   async snapshot(): Promise<DesktopObservation> {
     return {
+      observationId: "stub://observation/launch-ack",
       screenshotRef: "stub://snapshot/launch-ack",
+      snapshotAt: "2026-01-01T00:00:03.000Z",
       activeApp: "桌面",
       activeWindowTitle: "Desktop",
       ocrText: [],
       windows: ["Desktop"],
+      recentEvents: [],
       candidates: []
     };
   }
 
-  async validateAction(_action: DesktopAction, _approvalToken?: ApprovalToken) {
+  async validateAction(_action: DesktopAction, _context: BridgeActionContext) {
     return {
       allowed: true,
       reason: "Allowed for launch-ack test."
@@ -366,7 +389,7 @@ class LaunchAckOnlyBridgeClient implements BridgeClient {
 }
 
 class ContactAckOnlyBridgeClient extends StubBridgeClient {
-  async performAction(action: DesktopAction, approvalToken?: ApprovalToken): Promise<BridgeActionResult> {
+  async performAction(action: DesktopAction, context: BridgeActionContext): Promise<BridgeActionResult> {
     if (action.kind === "external.select_contact") {
       const contact =
         (typeof action.args.contact === "string" && action.args.contact.trim()) ||
@@ -377,16 +400,19 @@ class ContactAckOnlyBridgeClient extends StubBridgeClient {
       };
     }
 
-    return super.performAction(action, approvalToken);
+    return super.performAction(action, context);
   }
 
   async snapshot(): Promise<DesktopObservation> {
     return {
+      observationId: "stub://observation/contact-ack-only",
       screenshotRef: "stub://snapshot/contact-ack-only",
+      snapshotAt: "2026-01-01T00:00:04.000Z",
       activeApp: "WeChat",
       activeWindowTitle: "WeChat",
       ocrText: [],
       windows: ["WeChat"],
+      recentEvents: [],
       candidates: [
         {
           id: "contact-search",
@@ -480,6 +506,81 @@ class SemanticCandidatesBridgeClient extends StubBridgeClient {
   }
 }
 
+class LegacyProtocolBridgeClient extends StubBridgeClient {
+  override async describeCapabilities(): Promise<BridgeCapabilities> {
+    return {
+      ...(await super.describeCapabilities()),
+      protocolVersion: 2
+    };
+  }
+}
+
+class ActionScopedEventBridgeClient extends NonVerifyingBridgeClient {
+  private performed = false;
+  private readonly beforeEventAt = new Date(Date.now() - 60_000).toISOString();
+  private readonly afterEventAt = new Date(Date.now() + 1_000).toISOString();
+
+  constructor(private readonly includeFreshEvent: boolean) {
+    super();
+  }
+
+  override async performAction(_action: DesktopAction, _context: BridgeActionContext): Promise<BridgeActionResult> {
+    this.performed = true;
+    return {
+      status: "performed"
+    };
+  }
+
+  override async snapshot(): Promise<DesktopObservation> {
+    const beforeEvent = {
+      id: "event-before",
+      kind: "focus.changed",
+      message: "Before action",
+      createdAt: this.beforeEventAt,
+      sequence: 1
+    };
+
+    return {
+      observationId: this.performed
+        ? `stub://observation/action-scoped-${this.includeFreshEvent ? "fresh" : "stale"}`
+        : "stub://observation/action-scoped-before",
+      screenshotRef: this.performed
+        ? `stub://snapshot/action-scoped-${this.includeFreshEvent ? "fresh" : "stale"}`
+        : "stub://snapshot/action-scoped-before",
+      snapshotAt: this.performed ? this.afterEventAt : this.beforeEventAt,
+      activeApp: "Finder",
+      activeWindowTitle: "Finder Window",
+      ocrText: [],
+      windows: ["Finder Window"],
+      recentEvents: this.performed
+        ? this.includeFreshEvent
+          ? [
+              beforeEvent,
+              {
+                id: "event-after",
+                kind: "focus.changed",
+                message: "After action",
+                createdAt: this.afterEventAt,
+                sequence: 2
+              }
+            ]
+          : [beforeEvent]
+        : [beforeEvent],
+      candidates: [
+        {
+          id: "search-field",
+          role: "text field",
+          label: "Search",
+          value: "",
+          focused: false,
+          confidence: 0.9,
+          source: "ax"
+        }
+      ]
+    };
+  }
+}
+
 class VisionAnsweringRouter extends ModelRouter {
   constructor(private readonly reply: string) {
     super(createTestRouter().listProfiles());
@@ -516,6 +617,26 @@ function mergeCandidates(candidates: DesktopObservation["candidates"]) {
 }
 
 describe("RpcServer runtime flow", () => {
+  it("rejects task creation when the bridge protocol is older than the canonical contract", async () => {
+    const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
+    const persistence = await createRuntimePersistence({
+      path: join(runtimeDir, "runtime.sqlite")
+    });
+    const server = new RpcServer(
+      join(runtimeDir, "lobsterd.sock"),
+      createTestRouter(),
+      persistence,
+      new LegacyProtocolBridgeClient(),
+      new NoopRuntimeNotifier()
+    );
+
+    await expect(server.createTask(createTask('click "Search"'))).rejects.toThrow(
+      "Bridge protocol version 2 is too old"
+    );
+
+    rmSync(runtimeDir, { recursive: true, force: true });
+  });
+
   it("issues an approval ticket for yellow tasks and completes after approval", async () => {
     const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
     const persistence = await createRuntimePersistence({
@@ -537,7 +658,8 @@ describe("RpcServer runtime flow", () => {
     const approved = await server.approveTicket(created.approvalTicket!.id, "tester");
 
     expect(approved.run.status).toBe("completed");
-    expect(approved.token.riskLevel).toBe("yellow");
+    expect(approved.token).toBeDefined();
+    expect(approved.token?.riskLevel).toBe("yellow");
 
     rmSync(runtimeDir, { recursive: true, force: true });
   });
@@ -1551,10 +1673,142 @@ describe("RpcServer runtime flow", () => {
       candidateId: "ocr-search",
       label: "Search",
       source: "ocr",
+      observationId: "stub://observation/ocr-only",
       screenshotRef: "stub://snapshot/ocr-only",
       snapshotAt: "2026-01-01T00:00:05.000Z"
     });
     expect(clickStep?.action.targetDescriptor).toHaveProperty("bounds");
+    expect(clickStep?.action.targetDescriptor).not.toHaveProperty("snapshotRef");
+
+    rmSync(runtimeDir, { recursive: true, force: true });
+  });
+
+  it("ignores stale pre-action events during click verification", async () => {
+    const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
+    const persistence = await createRuntimePersistence({
+      path: join(runtimeDir, "runtime.sqlite")
+    });
+    const server = new RpcServer(
+      join(runtimeDir, "lobsterd.sock"),
+      createTestRouter(),
+      persistence,
+      new ActionScopedEventBridgeClient(false),
+      new NoopRuntimeNotifier()
+    );
+
+    const created = await server.createTask(createTask('click "Search"'));
+
+    expect(created.run.status).toBe("failed");
+    expect(created.run.verification?.message).toContain("no window change was observed");
+    expect(created.run.verification?.message).not.toContain("Observed focus.changed");
+    expect(created.run.verification?.evidence).not.toContain("Before action");
+    expect(created.run.verification?.evidenceItems.every((item) => item.kind === "settle_window")).toBe(true);
+    expect(created.run.outcomeSummary).toContain('Target "Search" was not focused');
+    expect(created.run.outcomeSummary).not.toContain("Observed focus.changed");
+    expect(created.run.latestObservation?.recentEvents).toHaveLength(1);
+
+    rmSync(runtimeDir, { recursive: true, force: true });
+  });
+
+  it("accepts only post-action events as click verification evidence", async () => {
+    const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
+    const persistence = await createRuntimePersistence({
+      path: join(runtimeDir, "runtime.sqlite")
+    });
+    const server = new RpcServer(
+      join(runtimeDir, "lobsterd.sock"),
+      createTestRouter(),
+      persistence,
+      new ActionScopedEventBridgeClient(true),
+      new NoopRuntimeNotifier()
+    );
+
+    const created = await server.createTask(createTask('click "Search"'));
+
+    expect(created.run.status).toBe("completed");
+    expect(created.run.verification?.status).toBe("verified");
+    expect(created.run.verification?.message).toContain("Observed focus.changed");
+    expect(created.run.verification?.evidence).toContain("After action");
+    expect(created.run.outcomeSummary).toContain("Observed focus.changed");
+    expect(created.run.latestObservation?.recentEvents).toHaveLength(2);
+
+    rmSync(runtimeDir, { recursive: true, force: true });
+  });
+
+  it("expires recovered approvals that lack canonical observation provenance", async () => {
+    const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
+    const persistence = await createRuntimePersistence({
+      path: join(runtimeDir, "runtime.sqlite")
+    });
+    const request = createTask("edit the current document");
+    const action: DesktopAction = {
+      id: "action-edit-existing",
+      kind: "ui.edit_existing",
+      target: "Current document",
+      args: {
+        instruction: "Tighten the executive summary."
+      },
+      targetDescriptor: {
+        candidateId: "document-body",
+        label: "Current document",
+        role: "document",
+        source: "ax",
+        screenshotRef: "stub://snapshot/legacy",
+        snapshotAt: "2026-01-01T00:00:00.000Z"
+      },
+      riskLevel: "yellow",
+      preconditions: [],
+      successCheck: []
+    };
+    const run: TaskRun = {
+      runId: "run-recovered-legacy-approval",
+      request,
+      status: "awaiting_approval",
+      riskLevel: "yellow",
+      plan: [
+        {
+          id: "step-edit-existing",
+          title: "Edit the current document",
+          intent: "Apply the requested edit",
+          action,
+          fallback: [],
+          successCriteria: []
+        }
+      ],
+      currentStepId: "step-edit-existing",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z"
+    };
+    const approval: ApprovalTicket = {
+      id: "approval-recovered-legacy",
+      runId: run.runId,
+      reason: "Requires human approval.",
+      action,
+      findings: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      state: "pending"
+    };
+
+    await persistence.saveRun(run);
+    await persistence.saveApproval(approval);
+
+    const server = new RpcServer(
+      join(runtimeDir, "lobsterd.sock"),
+      createTestRouter(),
+      persistence,
+      new StubBridgeClient(),
+      new NoopRuntimeNotifier()
+    );
+
+    await (server as any).loadState();
+    const approvals = await server.listApprovals();
+    const recoveredRun = await server.getRun(run.runId);
+
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]?.state).toBe("expired");
+    expect(recoveredRun?.status).toBe("blocked");
+    expect(recoveredRun?.outcomeSummary).toContain("canonical observation provenance");
+    expect(recoveredRun?.outcomeSummary).toContain("fresh approval ticket");
 
     rmSync(runtimeDir, { recursive: true, force: true });
   });

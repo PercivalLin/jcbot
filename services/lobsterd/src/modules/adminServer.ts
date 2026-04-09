@@ -290,7 +290,8 @@ const ACTIVE_RUN_STATUSES = new Set<TaskRun["status"]>([
 function serializeRun(run: TaskRun) {
   const currentStepIndex = run.currentStepId ? run.plan.findIndex((step) => step.id === run.currentStepId) + 1 : 0;
   const latestObservation = run.latestObservation
-    ? {
+      ? {
+        observationId: run.latestObservation.observationId,
         activeApp: run.latestObservation.activeApp,
         activeWindowTitle: run.latestObservation.activeWindowTitle,
         candidatePreview: run.latestObservation.candidates.slice(0, 8).map((candidate) => ({

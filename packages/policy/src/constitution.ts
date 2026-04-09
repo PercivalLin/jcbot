@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
 import YAML from "yaml";
 import type { DesktopAction, RiskLevel, SelfCheckFinding, SelfCheckResult } from "@lobster/shared";
+import { fingerprintCanonicalAction } from "./canonicalAction.js";
 
 export type ConstitutionRule = {
   id: string;
@@ -33,16 +33,7 @@ export function flattenRules(pack: ConstitutionPack): ConstitutionRule[] {
 }
 
 export function fingerprintAction(action: DesktopAction): string {
-  return createHash("sha256")
-    .update(
-      JSON.stringify({
-        kind: action.kind,
-        target: action.target,
-        args: action.args,
-        targetDescriptor: action.targetDescriptor
-      })
-    )
-    .digest("hex");
+  return fingerprintCanonicalAction(action);
 }
 
 export function evaluateActionAgainstConstitution(

@@ -22,6 +22,20 @@ enum BridgePolicy {
 
     static func validate(action: ActionRequest, now: Date = Date()) -> PolicyValidationResult {
         let actionKind = action.actionKind
+        if action.actionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return PolicyValidationResult(
+                allowed: false,
+                reason: "Action request is missing canonical actionId."
+            )
+        }
+
+        if action.runId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return PolicyValidationResult(
+                allowed: false,
+                reason: "Action request is missing canonical runId."
+            )
+        }
+
         if hardRedActionKinds.contains(actionKind) {
             return PolicyValidationResult(
                 allowed: false,
@@ -65,6 +79,13 @@ enum BridgePolicy {
                 )
             }
 
+            if approvalToken.runId != action.runId {
+                return PolicyValidationResult(
+                    allowed: false,
+                    reason: "Approval token runId does not match the current bridge request."
+                )
+            }
+
             let expectedFingerprint = actionFingerprint(for: action)
             if approvalToken.actionFingerprint != expectedFingerprint {
                 return PolicyValidationResult(
@@ -93,16 +114,66 @@ enum BridgePolicy {
 
     static func actionFingerprint(for action: ActionRequest) -> String {
         var payload: [String: Any] = [
-            "args": action.rawArgs,
+            "actionId": action.actionId,
+            "args": canonicalArgs(action.rawArgs),
             "kind": action.actionKind
         ]
         if let target = action.target, target.isEmpty == false {
             payload["target"] = target
         }
 
+        if let descriptor = canonicalTargetDescriptor(action.targetDescriptor) {
+            payload["targetDescriptor"] = descriptor
+        }
+
         let canonical = canonicalJSONString(payload)
         let digest = SHA256.hash(data: Data(canonical.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func canonicalArgs(_ rawArgs: Any) -> Any {
+        guard let dictionary = rawArgs as? [String: Any] else {
+            return rawArgs
+        }
+
+        var result: [String: Any] = [:]
+        for (key, value) in dictionary where key != "targetDescriptor" {
+            result[key] = value
+        }
+        return result
+    }
+
+    private static func canonicalTargetDescriptor(_ descriptor: TargetDescriptor?) -> [String: Any]? {
+        guard let descriptor else {
+            return nil
+        }
+
+        var payload: [String: Any] = [
+            "candidateId": descriptor.candidateId ?? "",
+            "label": descriptor.label ?? "",
+            "source": descriptor.source
+        ]
+        if let role = descriptor.role {
+            payload["role"] = role
+        }
+        if let observationId = descriptor.observationId {
+            payload["observationId"] = observationId
+        }
+        if let screenshotRef = descriptor.screenshotRef {
+            payload["screenshotRef"] = screenshotRef
+        }
+        if let snapshotAt = descriptor.snapshotAt {
+            payload["snapshotAt"] = snapshotAt
+        }
+        if let bounds = descriptor.bounds {
+            payload["bounds"] = [
+                "height": bounds.height,
+                "width": bounds.width,
+                "x": bounds.x,
+                "y": bounds.y
+            ]
+        }
+        return payload
     }
 
     private static func canonicalJSONString(_ value: Any) -> String {
@@ -132,7 +203,7 @@ enum BridgePolicy {
         if let data = try? JSONSerialization.data(withJSONObject: [value], options: []),
            let text = String(data: data, encoding: .utf8),
            text.count >= 2 {
-            return String(text.dropFirst().dropLast())
+            return String(text.dropFirst().dropLast()).replacingOccurrences(of: "\\/", with: "/")
         }
 
         return "\"\""

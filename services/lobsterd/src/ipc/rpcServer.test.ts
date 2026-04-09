@@ -252,6 +252,70 @@ class RecoveringTypingBridgeClient implements BridgeClient {
   }
 }
 
+class SettlingTypingBridgeClient implements BridgeClient {
+  public actionAttempts = 0;
+  public postActionSnapshots = 0;
+
+  async configureKnownApplications() {
+    return;
+  }
+
+  async describeCapabilities(): Promise<BridgeCapabilities> {
+    return {
+      accessibility: true,
+      eventTap: true,
+      ocr: false,
+      policyHardGate: true,
+      screenCapture: true
+    };
+  }
+
+  async searchApplications(_query: string): Promise<string[]> {
+    return [];
+  }
+
+  async performAction(_action: DesktopAction, _approvalToken?: ApprovalToken): Promise<BridgeActionResult> {
+    this.actionAttempts += 1;
+    return {
+      status: "performed"
+    };
+  }
+
+  async snapshot(): Promise<DesktopObservation> {
+    if (this.actionAttempts > 0) {
+      this.postActionSnapshots += 1;
+    }
+
+    const typedValue = this.postActionSnapshots >= 2 ? "hello world" : "";
+    return {
+      screenshotRef: `stub://snapshot/settling-${this.postActionSnapshots}`,
+      snapshotAt: `2026-01-01T00:00:0${Math.min(this.postActionSnapshots, 9)}.000Z`,
+      activeApp: "Finder",
+      activeWindowTitle: "Finder Window",
+      ocrText: [],
+      windows: ["Finder Window"],
+      candidates: [
+        {
+          id: "search-field",
+          role: "text field",
+          label: "Search",
+          value: typedValue,
+          focused: this.actionAttempts > 0,
+          confidence: 0.9,
+          source: "ax"
+        }
+      ]
+    };
+  }
+
+  async validateAction(_action: DesktopAction, _approvalToken?: ApprovalToken) {
+    return {
+      allowed: true,
+      reason: "Allowed for settle-window test."
+    };
+  }
+}
+
 class LaunchAckOnlyBridgeClient implements BridgeClient {
   async configureKnownApplications() {
     return;
@@ -1415,6 +1479,31 @@ describe("RpcServer runtime flow", () => {
     expect(created.run.status).toBe("completed");
     expect(created.run.outcomeSummary).toContain('Target "Search" now contains the requested text');
     expect(bridge.actionAttempts).toBe(2);
+
+    rmSync(runtimeDir, { recursive: true, force: true });
+  });
+
+  it("waits for a settled post-action snapshot before escalating semantic typing", async () => {
+    const runtimeDir = mkdtempSync(join(tmpdir(), "lobster-rpc-"));
+    const persistence = await createRuntimePersistence({
+      path: join(runtimeDir, "runtime.sqlite")
+    });
+    const bridge = new SettlingTypingBridgeClient();
+    const server = new RpcServer(
+      join(runtimeDir, "lobsterd.sock"),
+      createTestRouter(),
+      persistence,
+      bridge,
+      new NoopRuntimeNotifier()
+    );
+
+    const created = await server.createTask(createTask('在 "Search" 输入 "hello world"'));
+
+    expect(created.run.status).toBe("completed");
+    expect(created.run.outcomeSummary).toContain('Target "Search" now contains the requested text');
+    expect(bridge.actionAttempts).toBe(1);
+    expect(bridge.postActionSnapshots).toBeGreaterThanOrEqual(2);
+    expect(created.run.verification?.evidenceItems.some((item) => item.kind === "settle_window")).toBe(true);
 
     rmSync(runtimeDir, { recursive: true, force: true });
   });

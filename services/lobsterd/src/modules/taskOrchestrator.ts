@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { END, START, Annotation, StateGraph } from "@langchain/langgraph";
 import {
   type ApprovalToken,
@@ -267,24 +268,27 @@ export class TaskOrchestrator {
       }
 
       const action = this.resolveCurrentAction(state.run);
-      const observation = await this.bridgeClient.snapshot();
-      const baseVerification = this.verifyActionOutcome(action, state.observation, observation, state.executionReport);
+      const settledObservation = await this.capturePostActionObservation(
+        action,
+        state.observation,
+        state.executionReport
+      );
       const verification = await this.refineVerificationWithVision(
         action,
         state.observation,
-        observation,
-        baseVerification
+        settledObservation.observation,
+        settledObservation.verification
       );
       const run = {
         ...state.run,
         status: this.statusForVerification(verification),
-        latestObservation: observation,
+        latestObservation: settledObservation.observation,
         verification,
         outcomeSummary: verification.message,
         updatedAt: new Date().toISOString()
       };
       await this.emitRunEvent(run, "run.status_changed", verification.message);
-      return { observation, executionReport: verification.message, run };
+      return { observation: settledObservation.observation, executionReport: verification.message, run };
     })
     .addNode("report", async (state) => {
       const denialExplanation =
@@ -3000,6 +3004,150 @@ export class TaskOrchestrator {
               `${action.kind} executed, but the post-action desktop state was not directly verifiable.`
             );
     }
+  }
+
+  private async capturePostActionObservation(
+    action: DesktopAction,
+    before: DesktopObservation | undefined,
+    executionReport?: string
+  ) {
+    const policy = this.settlePolicyForAction(action);
+    let latestObservation: DesktopObservation | undefined;
+    let latestVerification: VerificationResult | undefined;
+
+    for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
+      if (attempt > 1 && policy.retryDelayMs > 0) {
+        await sleep(policy.retryDelayMs);
+      }
+
+      const observation = await this.bridgeClient.snapshot();
+      const verification = this.verifyActionOutcome(action, before, observation, executionReport);
+      latestObservation = observation;
+      latestVerification = verification;
+
+      if (!this.shouldRetryPostActionVerification(action, verification, before, observation, executionReport, attempt, policy.maxAttempts)) {
+        return {
+          observation,
+          verification: this.withSettleEvidence(verification, observation, attempt)
+        };
+      }
+    }
+
+    return {
+      observation: latestObservation!,
+      verification: this.withSettleEvidence(latestVerification!, latestObservation!, policy.maxAttempts)
+    };
+  }
+
+  private settlePolicyForAction(action: DesktopAction) {
+    switch (action.kind) {
+      case "ui.open_app":
+      case "ui.activate_app":
+      case "external.upload_file":
+        return { maxAttempts: 3, retryDelayMs: 180 };
+      case "ui.focus_target":
+      case "ui.click_target":
+      case "external.select_contact":
+        return { maxAttempts: 3, retryDelayMs: 120 };
+      case "ui.type_into_target":
+      case "ui.type_text":
+      case "ui.paste_text":
+        return { maxAttempts: 3, retryDelayMs: 100 };
+      case "ui.hotkey":
+      case "ui.scroll":
+        return { maxAttempts: 2, retryDelayMs: 120 };
+      default:
+        return { maxAttempts: 2, retryDelayMs: 80 };
+    }
+  }
+
+  private shouldRetryPostActionVerification(
+    action: DesktopAction,
+    verification: VerificationResult,
+    before: DesktopObservation | undefined,
+    after: DesktopObservation,
+    executionReport: string | undefined,
+    attempt: number,
+    maxAttempts: number
+  ) {
+    if (verification.status === "verified") {
+      return false;
+    }
+
+    if (attempt >= maxAttempts) {
+      return false;
+    }
+
+    if (this.isTerminalExecutionReport(executionReport)) {
+      return false;
+    }
+
+    if (!this.isObservationFreshComparedTo(before, after)) {
+      return true;
+    }
+
+    switch (action.kind) {
+      case "ui.open_app":
+      case "ui.activate_app":
+      case "ui.focus_target":
+      case "ui.click_target":
+      case "ui.type_into_target":
+      case "ui.type_text":
+      case "ui.paste_text":
+      case "external.select_contact":
+      case "external.upload_file":
+      case "ui.hotkey":
+      case "ui.scroll":
+        return true;
+      default:
+        return verification.status === "dispatched_unverified";
+    }
+  }
+
+  private isObservationFreshComparedTo(before: DesktopObservation | undefined, after: DesktopObservation) {
+    if (!before) {
+      return true;
+    }
+
+    if (before.snapshotAt && after.snapshotAt) {
+      return before.snapshotAt !== after.snapshotAt;
+    }
+
+    if (before.screenshotRef !== after.screenshotRef) {
+      return true;
+    }
+
+    return this.hasMeaningfulObservationDiff(before, after);
+  }
+
+  private isTerminalExecutionReport(executionReport?: string) {
+    const normalized = executionReport?.trim().toLowerCase() ?? "";
+    return normalized.startsWith("noop:") || normalized.startsWith("error:");
+  }
+
+  private withSettleEvidence(
+    verification: VerificationResult,
+    observation: DesktopObservation,
+    attempts: number
+  ): VerificationResult {
+    if (attempts <= 1) {
+      return verification;
+    }
+
+    return {
+      ...verification,
+      evidenceItems: this.mergeEvidenceItems(verification.evidence, [
+        ...verification.evidenceItems,
+        {
+          source: "local",
+          kind: "settle_window",
+          field: "settleAttempts",
+          message: `Post-action verification settled after ${attempts} observations.`,
+          value: String(attempts),
+          screenshotRef: observation.screenshotRef
+        }
+      ])
+    };
   }
 
   private verificationVerified(
